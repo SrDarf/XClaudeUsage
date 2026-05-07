@@ -7,7 +7,7 @@
 ## What it shows
 
 ```
-claude-sonnet-4-6 │ my-project │ ██████░░░░ out:42.3k/700.0k · 5h:61%
+claude-sonnet-4-6 │ my-project │ ██████░░░░ out:427.0k/700.0k · 5h:61%
 ```
 
 | Segment | Description |
