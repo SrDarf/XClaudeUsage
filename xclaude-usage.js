@@ -92,6 +92,16 @@ function readSessionTokens(transcriptPath, session) {
   return total;
 }
 
+function fmtCountdown(resetsAt) {
+  const secsLeft = Math.max(0, resetsAt - Math.floor(Date.now() / 1000));
+  const h = Math.floor(secsLeft / 3600);
+  const m = Math.floor((secsLeft % 3600) / 60);
+  const s = secsLeft % 60;
+  if (h > 0) return `${h}h${String(m).padStart(2, '0')}m`;
+  if (m > 0) return `${m}m${String(s).padStart(2, '0')}s`;
+  return `${s}s`;
+}
+
 function fmtTokens(n) {
   if (!n) return '0';
   if (n < 1000) return String(n);
@@ -110,6 +120,8 @@ function runStatusline() {
 
     try {
       const data = JSON.parse(input);
+
+
       const model = data.model?.display_name || 'Claude';
       const dir = data.workspace?.current_dir || process.cwd();
       const session = data.session_id || '';
@@ -139,9 +151,13 @@ function runStatusline() {
           }
         }
 
+        const countdownLabel = fiveHour.resets_at
+          ? ` · resets:${fmtCountdown(fiveHour.resets_at)}`
+          : '';
+
         tokenStr =
           ` │ \x1b[${barColor}m${bar}\x1b[0m ` +
-          `\x1b[2m${outLabel}5h:${tokenPct}%\x1b[0m`;
+          `\x1b[2m${outLabel}${tokenPct}%${countdownLabel}\x1b[0m`;
       } else if (tokens && tokens.output > 0) {
         tokenStr = ` │ \x1b[2mout:${fmtTokens(tokens.output)}\x1b[0m`;
       }
