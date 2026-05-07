@@ -2,7 +2,42 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
+const DB_PATH = path.join(os.homedir(), '.claude', 'data', 'xclaude-usage.db');
 const EMPTY_ENTRY = () => ({ offset: 0, input: 0, output: 0, cache_creation: 0, cache_read: 0 });
+
+function readWindowTokensFromDB(fiveHour) {
+  if (!fiveHour?.resets_at) return null;
+  if (!fs.existsSync(DB_PATH)) return null;
+
+  let DatabaseSync;
+  try { ({ DatabaseSync } = require('node:sqlite')); } catch { return null; }
+
+  const end = fiveHour.resets_at;
+  const start = end - 5 * 3600;
+
+  let db;
+  try {
+    db = new DatabaseSync(DB_PATH, { readOnly: true });
+    db.exec('PRAGMA busy_timeout = 2000;');
+    const rows = db.prepare(`
+      SELECT token_type, SUM(quantity) AS total
+      FROM token_usage
+      WHERE executed_at >= ? AND executed_at < ?
+      GROUP BY token_type
+    `).all(start, end);
+
+    if (rows.length === 0) return null;
+    const totals = { input: 0, output: 0, cache_creation: 0, cache_read: 0 };
+    for (const r of rows) {
+      if (totals[r.token_type] != null) totals[r.token_type] = Number(r.total) || 0;
+    }
+    return totals;
+  } catch {
+    return null;
+  } finally {
+    if (db) try { db.close(); } catch {}
+  }
+}
 
 function consumeTranscript(filePath, entry) {
   let stat;
@@ -127,8 +162,8 @@ function runStatusline() {
       const session = data.session_id || '';
 
       let tokenStr = '';
-      const tokens = readSessionTokens(data.transcript_path, session);
       const fiveHour = data.rate_limits?.five_hour;
+      const tokens = readWindowTokensFromDB(fiveHour) || readSessionTokens(data.transcript_path, session);
 
       if (fiveHour != null && fiveHour.used_percentage != null) {
         const tokenPct = Math.min(100, Math.round(fiveHour.used_percentage));
