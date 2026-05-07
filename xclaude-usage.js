@@ -19,19 +19,44 @@ function readWindowTokensFromDB(fiveHour) {
   try {
     db = new DatabaseSync(DB_PATH, { readOnly: true });
     db.exec('PRAGMA busy_timeout = 2000;');
-    const rows = db.prepare(`
+
+    const totals = { input: 0, output: 0, cache_creation: 0, cache_read: 0 };
+    let anyRows = false;
+
+    const localRows = db.prepare(`
       SELECT token_type, SUM(quantity) AS total
       FROM token_usage
       WHERE executed_at >= ? AND executed_at < ?
       GROUP BY token_type
     `).all(start, end);
-
-    if (rows.length === 0) return null;
-    const totals = { input: 0, output: 0, cache_creation: 0, cache_read: 0 };
-    for (const r of rows) {
-      if (totals[r.token_type] != null) totals[r.token_type] = Number(r.total) || 0;
+    if (localRows.length > 0) {
+      anyRows = true;
+      for (const r of localRows) {
+        if (totals[r.token_type] != null) totals[r.token_type] += Number(r.total) || 0;
+      }
     }
-    return totals;
+
+    try {
+      const cloudRow = db.prepare(`
+        SELECT
+          COALESCE(SUM(input), 0)          AS input,
+          COALESCE(SUM(output), 0)         AS output,
+          COALESCE(SUM(cache_creation), 0) AS cache_creation,
+          COALESCE(SUM(cache_read), 0)     AS cache_read,
+          COUNT(*)                         AS n
+        FROM cloud_cache
+        WHERE executed_at >= ? AND executed_at < ?
+      `).get(start, end);
+      if (cloudRow && Number(cloudRow.n) > 0) {
+        anyRows = true;
+        totals.input          += Number(cloudRow.input) || 0;
+        totals.output         += Number(cloudRow.output) || 0;
+        totals.cache_creation += Number(cloudRow.cache_creation) || 0;
+        totals.cache_read     += Number(cloudRow.cache_read) || 0;
+      }
+    } catch {}
+
+    return anyRows ? totals : null;
   } catch {
     return null;
   } finally {
