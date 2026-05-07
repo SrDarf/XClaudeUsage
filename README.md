@@ -7,7 +7,7 @@
 ## What it shows
 
 ```
-claude-sonnet-4-6 │ my-project │ ██████░░░░ out:427.0k/700.0k · 5h:61%
+claude-sonnet-4-6 │ my-project │ ██████░░░░ out:427.0k/700.0k · 61% · resets:1h23m
 ```
 
 | Segment | Description |
@@ -16,7 +16,8 @@ claude-sonnet-4-6 │ my-project │ ██████░░░░ out:427.0k/7
 | Directory | Current working directory |
 | Progress bar | 5-hour session usage (`█` filled, `░` empty), color-coded |
 | `out:X/Y` | Output tokens used vs derived session limit |
-| `5h:X%` | Percentage of 5-hour window consumed |
+| `X%` | Percentage of 5-hour window consumed |
+| `resets:Xh##m` | Exact time remaining until the 5-hour window resets |
 
 **Bar colors:**
 - Green — under 50%
@@ -89,6 +90,7 @@ The statusline appears automatically on the next session.
 - Parses transcript JSONL files incrementally to count input/output/cache tokens
 - Caches progress in `%TEMP%/claude-tokens-{session}.json` to avoid re-reading on every tick
 - Derives the real output token limit from Anthropic's own `rate_limits.five_hour.used_percentage` — no hardcoded values
+- Calculates exact reset countdown from `rate_limits.five_hour.resets_at` Unix timestamp
 - Falls back to raw output token count when rate limit data isn't yet available
 
 ---
