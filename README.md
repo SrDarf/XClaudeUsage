@@ -38,15 +38,16 @@ claude-sonnet-4-6 │ my-project │ ██████░░░░ out:427.0k/7
 
 **1. Download the hook**
 
+macOS/Linux:
 ```bash
+mkdir -p ~/.claude/hooks
 curl -o ~/.claude/hooks/xclaude-usage.js \
   https://raw.githubusercontent.com/SrDarf/XClaudeUsage/main/xclaude-usage.js
 ```
 
-Or manually copy `xclaude-usage.js` to `~/.claude/hooks/`.
-
-**On Windows:**
+Windows (PowerShell):
 ```powershell
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude\hooks" | Out-Null
 curl -o "$env:USERPROFILE\.claude\hooks\xclaude-usage.js" `
   https://raw.githubusercontent.com/SrDarf/XClaudeUsage/main/xclaude-usage.js
 ```
@@ -55,26 +56,23 @@ curl -o "$env:USERPROFILE\.claude\hooks\xclaude-usage.js" `
 
 **2. Register in settings.json**
 
-Open `~/.claude/settings.json` (create if it doesn't exist) and add:
+Open `~/.claude/settings.json` (Windows: `%USERPROFILE%\.claude\settings.json`) and add the `statusLine` key:
 
 ```json
 {
   "statusLine": {
     "type": "command",
-    "command": "node \"/absolute/path/to/.claude/hooks/xclaude-usage.js\""
+    "command": "node \"/Users/yourname/.claude/hooks/xclaude-usage.js\""
   }
 }
 ```
 
-**macOS/Linux example:**
-```json
-"command": "node \"/Users/yourname/.claude/hooks/xclaude-usage.js\""
-```
-
-**Windows example:**
+Windows example:
 ```json
 "command": "node \"C:/Users/yourname/.claude/hooks/xclaude-usage.js\""
 ```
+
+> If `settings.json` already exists with other settings, just add the `"statusLine"` key alongside them — do not replace the whole file.
 
 ---
 
