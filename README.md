@@ -34,7 +34,50 @@ claude-sonnet-4-6 │ my-project │ ██████░░░░ out:427.0k/7
 
 ---
 
-## Install
+## Quick install (automated)
+
+Cross-platform Node.js installer. Pick the line for your shell:
+
+macOS / Linux:
+```bash
+curl -fsSL https://raw.githubusercontent.com/SrDarf/XClaudeUsage/main/install.js | node
+```
+
+Windows (PowerShell):
+```powershell
+irm https://raw.githubusercontent.com/SrDarf/XClaudeUsage/main/install.js | node
+```
+
+The installer is interactive: it reads your answers from the terminal even when piped from `curl` / `irm` (it talks to the controlling TTY directly). If for some reason that doesn't work in your environment, just download it first and run it normally:
+
+```bash
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/SrDarf/XClaudeUsage/main/install.js -o install.js && node install.js
+
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/SrDarf/XClaudeUsage/main/install.js -OutFile install.js; node install.js
+```
+
+What it does:
+- Downloads both hooks into `~/.claude/hooks/`.
+- Merges the `statusLine` and the required `hooks` entries into your existing `~/.claude/settings.json` **without overwriting anything that isn't XClaude's** — entries from other tools sitting next to XClaude in the same hook event are preserved untouched.
+- Asks whether you want to enable Turso multi-device sync. If yes, prompts for the `libsql_url`, `auth_token`, and `device_id` and writes them to `~/.claude/data/xclaude-cloud.json`. **It does not create the Turso database** — provision that yourself first using the manual steps in [Multi-device sync](#multi-device-sync-opt-in) below.
+- Writes a timestamped backup of `settings.json` before any change.
+
+The installer aborts cleanly (without writing anything) if:
+- A non-XClaude `statusLine` is already configured — it won't replace someone else's statusline.
+- `settings.json` is malformed.
+- It cannot reach GitHub.
+
+Re-running the installer is safe: it detects existing XClaude entries in `settings.json` and updates them in-place rather than duplicating.
+
+Restart Claude Code in a fresh session to pick up the changes.
+
+---
+
+## Install (manual)
+
+> Use this path if you prefer to inspect every step, or if you're an AI agent walking through the install programmatically. The automated installer above performs the same operations.
 
 **1. Download both hooks**
 
