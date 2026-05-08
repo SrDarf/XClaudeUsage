@@ -9,7 +9,7 @@ const LOG_PATH = path.join(DATA_DIR, 'xclaude-usage.log');
 const CLOUD_CONFIG_PATH = path.join(DATA_DIR, 'xclaude-cloud.json');
 const LOG_MAX_BYTES = 1_000_000;
 const PULL_LIMIT = 500;
-const NETWORK_TIMEOUT_MS = 2000;
+const NETWORK_TIMEOUT_MS = 5000;
 const WINDOW_SECONDS = 5 * 3600;
 
 const TOKEN_FIELDS = [
