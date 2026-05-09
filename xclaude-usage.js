@@ -5,6 +5,48 @@ const os = require('os');
 const DB_PATH = path.join(os.homedir(), '.claude', 'data', 'xclaude-usage.db');
 const EMPTY_ENTRY = () => ({ offset: 0, input: 0, output: 0, cache_creation: 0, cache_read: 0 });
 
+function writeFiveHourWindow(fiveHour) {
+  if (!fiveHour
+      || typeof fiveHour.resets_at !== 'number'
+      || typeof fiveHour.used_percentage !== 'number') return;
+  if (!fs.existsSync(DB_PATH)) return;
+
+  let DatabaseSync;
+  try { ({ DatabaseSync } = require('node:sqlite')); } catch { return; }
+
+  let db;
+  try {
+    db = new DatabaseSync(DB_PATH);
+    db.exec('PRAGMA busy_timeout = 2000;');
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS five_hour_window (
+        id              INTEGER PRIMARY KEY CHECK (id = 1),
+        resets_at       INTEGER NOT NULL,
+        start_at        INTEGER NOT NULL,
+        used_percentage REAL    NOT NULL,
+        updated_at      INTEGER NOT NULL
+      )
+    `);
+
+    const resetsAt = fiveHour.resets_at;
+    const startAt  = resetsAt - 5 * 3600;
+    const now      = Math.floor(Date.now() / 1000);
+
+    db.prepare(`
+      INSERT INTO five_hour_window (id, resets_at, start_at, used_percentage, updated_at)
+      VALUES (1, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        resets_at       = excluded.resets_at,
+        start_at        = excluded.start_at,
+        used_percentage = excluded.used_percentage,
+        updated_at      = excluded.updated_at
+    `).run(resetsAt, startAt, fiveHour.used_percentage, now);
+  } catch {
+  } finally {
+    if (db) try { db.close(); } catch {}
+  }
+}
+
 function readWindowTokensFromDB(fiveHour) {
   if (!fiveHour?.resets_at) return null;
   if (!fs.existsSync(DB_PATH)) return null;
@@ -188,6 +230,7 @@ function runStatusline() {
 
       let tokenStr = '';
       const fiveHour = data.rate_limits?.five_hour;
+      writeFiveHourWindow(fiveHour);
       const tokens = readWindowTokensFromDB(fiveHour) || readSessionTokens(data.transcript_path, session);
 
       if (fiveHour != null && fiveHour.used_percentage != null) {
