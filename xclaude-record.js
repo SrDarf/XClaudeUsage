@@ -10,7 +10,8 @@ const CLOUD_CONFIG_PATH = path.join(DATA_DIR, 'xclaude-cloud.json');
 const LOG_MAX_BYTES = 1_000_000;
 const PULL_LIMIT = 500;
 const NETWORK_TIMEOUT_MS = 5000;
-const WINDOW_SECONDS = 5 * 3600;
+const RETENTION_SECONDS = 15 * 24 * 3600;
+const CLEANUP_INTERVAL_SECONDS = 24 * 3600;
 
 const TOKEN_FIELDS = [
   ['input', 'input_tokens'],
@@ -187,6 +188,32 @@ function setPushCursor(db, id) {
   `).run(String(id));
 }
 
+function getLastCleanupAt(db) {
+  const row = db.prepare("SELECT value FROM cloud_state WHERE key = 'last_cleanup_at'").get();
+  return row ? Number(row.value) || 0 : 0;
+}
+
+function setLastCleanupAt(db, ts) {
+  db.prepare(`
+    INSERT INTO cloud_state (key, value) VALUES ('last_cleanup_at', ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `).run(String(ts));
+}
+
+function runLocalRetentionCleanup(db, now) {
+  const cutoff = now - RETENTION_SECONDS;
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.prepare('DELETE FROM token_usage WHERE executed_at < ?').run(cutoff);
+    db.prepare('DELETE FROM cloud_cache WHERE executed_at < ?').run(cutoff);
+    setLastCleanupAt(db, now);
+    db.exec('COMMIT');
+  } catch (e) {
+    try { db.exec('ROLLBACK'); } catch {}
+    throw e;
+  }
+}
+
 function toLibsqlValue(v) {
   if (v === null || v === undefined) return { type: 'null' };
   if (typeof v === 'number') {
@@ -237,7 +264,7 @@ async function libsqlPipeline(url, token, statements) {
   return res.json();
 }
 
-async function syncCloud(config, db, deviceId, doPush, doPull) {
+async function syncCloud(config, db, deviceId, doPush, doPull, cleanupDue) {
   const outboxRows = doPush
     ? db.prepare('SELECT event_id, payload FROM cloud_outbox ORDER BY created_at ASC').all()
     : [];
@@ -269,15 +296,16 @@ async function syncCloud(config, db, deviceId, doPush, doPull) {
             FROM token_delta
             WHERE id > ? AND device_id != ? AND executed_at >= ?
             ORDER BY id ASC LIMIT ?`,
-      args: [lastRemoteId, deviceId, now - WINDOW_SECONDS, PULL_LIMIT],
+      args: [lastRemoteId, deviceId, now - RETENTION_SECONDS, PULL_LIMIT],
     });
   }
 
-  // Opportunistic TTL cleanup runs on every sync.
-  statements.push({
-    sql: 'DELETE FROM token_delta WHERE executed_at < ?',
-    args: [now - WINDOW_SECONDS],
-  });
+  if (cleanupDue) {
+    statements.push({
+      sql: 'DELETE FROM token_delta WHERE executed_at < ?',
+      args: [now - RETENTION_SECONDS],
+    });
+  }
 
   if (statements.length === 0) return;
 
@@ -319,8 +347,7 @@ async function syncCloud(config, db, deviceId, doPush, doPull) {
       }
       if (maxId > lastRemoteId) setCloudCursor(db, maxId);
     }
-    // Trim local cache to the 5h window so it can't grow unbounded.
-    db.prepare('DELETE FROM cloud_cache WHERE executed_at < ?').run(now - WINDOW_SECONDS);
+    db.prepare('DELETE FROM cloud_cache WHERE executed_at < ?').run(now - RETENTION_SECONDS);
     db.exec('COMMIT');
   } catch (e) {
     try { db.exec('ROLLBACK'); } catch {}
@@ -381,6 +408,11 @@ async function record(payload) {
       throw e;
     }
 
+    const cleanupDue = (now - getLastCleanupAt(db)) >= CLEANUP_INTERVAL_SECONDS;
+    if (cleanupDue) {
+      try { runLocalRetentionCleanup(db, now); } catch (e) { logErr(e); }
+    }
+
     if (!behavior.push && !behavior.pull) return;
     const config = loadCloudConfig();
     if (!config) return;
@@ -395,7 +427,7 @@ async function record(payload) {
       db.exec('BEGIN IMMEDIATE');
       try {
         const lastPushed = getOrInitPushCursor(db);
-        const windowStart = now - WINDOW_SECONDS;
+        const windowStart = now - RETENTION_SECONDS;
         const groups = db.prepare(`
           SELECT
             model,
@@ -445,7 +477,7 @@ async function record(payload) {
     }
 
     try {
-      await syncCloud(config, db, cloudDeviceId, behavior.push, behavior.pull);
+      await syncCloud(config, db, cloudDeviceId, behavior.push, behavior.pull, cleanupDue);
     } catch (e) {
       logErr(e);
     }
