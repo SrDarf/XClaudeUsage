@@ -25,9 +25,9 @@ turso db shell xclaude-usage < cloud/schema.sql
 
 Setup walkthrough (creating the database, generating a token, configuring each device) lives in the main [README](../README.md#multi-device-sync-opt-in).
 
-## TTL
+## Retention
 
-Each sync round (every `Stop` from a device that participates) appends `DELETE FROM token_delta WHERE executed_at < unixepoch() - 5*3600` to its pipeline, so rows older than 5 hours are pruned opportunistically. There is no separate cron required.
+Each sync round (every `Stop` from a device that participates) appends `DELETE FROM token_delta WHERE executed_at < unixepoch() - 15*86400` to its pipeline, so rows older than **15 days** are pruned opportunistically. There is no separate cron required.
 
 ## Inspection
 
@@ -38,7 +38,7 @@ A few queries that come up while debugging:
 SELECT id, device_id, model, output, datetime(executed_at,'unixepoch','localtime') AS ts
 FROM token_delta ORDER BY id DESC LIMIT 20;
 
--- Per-device totals in the current window
+-- Per-device totals in the current 5-hour window
 SELECT device_id, COUNT(*) AS rows, SUM(output) AS out_total
 FROM token_delta
 WHERE executed_at >= unixepoch() - 5*3600

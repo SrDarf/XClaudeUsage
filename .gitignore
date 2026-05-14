@@ -1,0 +1,25 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Cargo.lock is intentionally tracked: this is a binary crate, where committing
+# the lockfile gives reproducible builds for users running `cargo install`.
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Local environment / secrets
+.env
+.env.local
+.env.*.local
+
+# Claude Code local overrides
+.claude/settings.local.json
