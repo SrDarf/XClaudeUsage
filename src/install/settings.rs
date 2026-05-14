@@ -92,11 +92,26 @@ pub fn classify_status_line(settings: &Value) -> StatusLineState {
 }
 
 pub fn is_ours_statusline(cmd: &str) -> bool {
-    cmd.contains("xclaude-usage.js") || cmd.contains("xclaudeusage statusline")
+    if cmd.contains("xclaude-usage.js") {
+        return true;
+    }
+    // The installer writes commands like `"/path/to/xclaudeusage" statusline`,
+    // so a literal `"` sits between the path and the subcommand. Strip quotes
+    // before substring matching so single/double quoted paths both register.
+    let normalized = strip_shell_quotes(cmd);
+    normalized.contains("xclaudeusage statusline")
 }
 
 pub fn is_ours_record(cmd: &str) -> bool {
-    cmd.contains("xclaude-record.js") || cmd.contains("xclaudeusage record")
+    if cmd.contains("xclaude-record.js") {
+        return true;
+    }
+    let normalized = strip_shell_quotes(cmd);
+    normalized.contains("xclaudeusage record")
+}
+
+fn strip_shell_quotes(s: &str) -> String {
+    s.chars().filter(|c| *c != '"' && *c != '\'').collect()
 }
 
 /// Set the `statusLine` entry, preserving any extra fields on the existing
@@ -164,27 +179,37 @@ pub fn upsert_hooks(
         }
         let arr = list.as_array_mut().unwrap();
 
-        let mut touched = false;
-        for group in arr.iter_mut() {
+        // Sweep: keep exactly one XClaude entry per event (updating it to the
+        // desired command), drop any duplicates, and leave non-XClaude entries
+        // from other tools untouched. Groups that end up empty after dedup are
+        // dropped too so the array doesn't accumulate stubs.
+        let mut xclaude_seen = false;
+        arr.retain_mut(|group| {
             let Some(group_hooks) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
-                continue;
+                return true;
             };
-            for entry in group_hooks.iter_mut() {
+            group_hooks.retain_mut(|entry| {
                 let cmd = entry
                     .get("command")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 if is_ours_record(cmd) {
+                    if xclaude_seen {
+                        return false;
+                    }
+                    xclaude_seen = true;
                     *entry = desired_entry.clone();
-                    touched = true;
                 }
-            }
-        }
-        if !touched {
+                true
+            });
+            !group_hooks.is_empty()
+        });
+
+        if xclaude_seen {
+            summary.push(((*event).to_string(), "updated"));
+        } else {
             arr.push(json!({ "hooks": [desired_entry.clone()] }));
             summary.push(((*event).to_string(), "added"));
-        } else {
-            summary.push(((*event).to_string(), "updated"));
         }
     }
     summary
@@ -266,4 +291,94 @@ fn unix_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: the installer writes `"/path/to/xclaudeusage" statusline`,
+    // which has a literal `"` between the binary and subcommand. The naive
+    // substring `xclaudeusage statusline` (single space) didn't match,
+    // causing every re-install to abort or duplicate.
+    #[test]
+    fn detects_quoted_binary_paths() {
+        assert!(is_ours_statusline(
+            r#""/home/luka/.claude/bin/xclaudeusage" statusline"#
+        ));
+        assert!(is_ours_record(
+            r#""/home/luka/.claude/bin/xclaudeusage" record"#
+        ));
+        assert!(is_ours_statusline(
+            r#"'/home/luka/.claude/bin/xclaudeusage' statusline"#
+        ));
+    }
+
+    #[test]
+    fn detects_unquoted_and_legacy_paths() {
+        assert!(is_ours_statusline("node ~/.claude/hooks/xclaude-usage.js"));
+        assert!(is_ours_record("node ~/.claude/hooks/xclaude-record.js"));
+        assert!(is_ours_statusline("/usr/local/bin/xclaudeusage statusline"));
+        assert!(is_ours_record("/usr/local/bin/xclaudeusage record"));
+    }
+
+    #[test]
+    fn rejects_foreign_commands() {
+        assert!(!is_ours_statusline("starship prompt"));
+        assert!(!is_ours_record("some-other-tool record"));
+        assert!(!is_ours_statusline(""));
+    }
+
+    #[test]
+    fn upsert_hooks_collapses_duplicates() {
+        // Reproduces the user's broken state: two XClaude hook groups per event.
+        let cmd = r#""/home/luka/.claude/bin/xclaudeusage" record"#;
+        let mut settings = json!({
+            "hooks": {
+                "Stop": [
+                    { "hooks": [{ "type": "command", "command": cmd, "timeout": 10 }] },
+                    { "hooks": [{ "type": "command", "command": cmd, "timeout": 10 }] },
+                ]
+            }
+        });
+        let summary = upsert_hooks(&mut settings, &["Stop"], cmd);
+        assert_eq!(summary, vec![("Stop".to_string(), "updated")]);
+        let stop = settings["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 1, "duplicate XClaude groups should be collapsed");
+    }
+
+    #[test]
+    fn upsert_hooks_preserves_foreign_entries() {
+        let cmd = r#""/home/luka/.claude/bin/xclaudeusage" record"#;
+        let mut settings = json!({
+            "hooks": {
+                "Stop": [
+                    { "hooks": [{ "type": "command", "command": "other-tool log", "timeout": 5 }] },
+                ]
+            }
+        });
+        upsert_hooks(&mut settings, &["Stop"], cmd);
+        let stop = settings["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 2, "foreign entry kept + our new entry appended");
+        assert_eq!(stop[0]["hooks"][0]["command"], "other-tool log");
+    }
+
+    #[test]
+    fn upsert_hooks_adds_when_missing() {
+        let cmd = r#""/home/luka/.claude/bin/xclaudeusage" record"#;
+        let mut settings = json!({});
+        let summary = upsert_hooks(&mut settings, &["Stop"], cmd);
+        assert_eq!(summary, vec![("Stop".to_string(), "added")]);
+    }
+
+    #[test]
+    fn classify_status_line_works_for_quoted_path() {
+        let settings = json!({
+            "statusLine": {
+                "type": "command",
+                "command": r#""/home/luka/.claude/bin/xclaudeusage" statusline"#,
+            }
+        });
+        assert_eq!(classify_status_line(&settings), StatusLineState::Ours);
+    }
 }
