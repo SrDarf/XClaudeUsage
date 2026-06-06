@@ -1,9 +1,9 @@
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -170,6 +170,50 @@ fn write_local(
 ) -> Result<()> {
     let tx = db.transaction()?;
 
+    // Main session transcript.
+    ingest_transcript(
+        &tx,
+        session_id,
+        transcript_path,
+        fallback_model,
+        local_device_label,
+        now,
+    )?;
+
+    // Subagent and workflow transcripts. Claude Code writes the assistant
+    // events of Task subagents, deep-research, and ultracode dynamic workflows
+    // into a sibling `<session>/subagents/**/agent-*.jsonl` tree marked
+    // `isSidechain: true` — these are NEVER folded into the main transcript and
+    // the hook never hands us their paths, so we discover and ingest them here.
+    // Each file is tracked by its own `transcript_progress` offset and deduped
+    // by `message_uuid`, exactly like the main transcript.
+    for sub in subagent_transcripts(transcript_path) {
+        ingest_transcript(
+            &tx,
+            session_id,
+            &sub,
+            fallback_model,
+            local_device_label,
+            now,
+        )?;
+    }
+
+    tx.commit()?;
+    Ok(())
+}
+
+/// Incrementally read a single JSONL transcript from its saved byte offset,
+/// record any new assistant token-usage rows, and advance the offset. Safe to
+/// call for the main transcript and every subagent/workflow transcript within
+/// the same transaction.
+fn ingest_transcript(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    transcript_path: &Path,
+    fallback_model: Option<&str>,
+    device_label: &str,
+    now: i64,
+) -> Result<()> {
     let offset: i64 = tx
         .query_row(
             "SELECT byte_offset FROM transcript_progress WHERE transcript_path = ?1",
@@ -179,37 +223,36 @@ fn write_local(
         .optional()?
         .unwrap_or(0);
 
+    // `None` means the file couldn't be stat'd (e.g. removed between discovery
+    // and read) — skip it without disturbing other transcripts in this tx.
     let Some(read) = transcript::read_new(transcript_path, offset as u64)? else {
-        tx.commit()?;
         return Ok(());
     };
 
     if !read.text.is_empty() {
         let events = transcript::parse_assistant_events(&read.text, fallback_model);
-        {
-            let mut stmt = tx.prepare(
-                "INSERT OR IGNORE INTO token_usage \
-                 (session_id, model, token_type, quantity, executed_at, device_id, message_uuid) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            )?;
-            for ev in events {
-                for (ty, qty) in [
-                    ("input", ev.usage.input),
-                    ("output", ev.usage.output),
-                    ("cache_creation", ev.usage.cache_creation),
-                    ("cache_read", ev.usage.cache_read),
-                ] {
-                    if qty > 0 {
-                        stmt.execute(params![
-                            session_id,
-                            ev.model,
-                            ty,
-                            qty,
-                            now,
-                            local_device_label,
-                            ev.uuid,
-                        ])?;
-                    }
+        let mut stmt = tx.prepare(
+            "INSERT OR IGNORE INTO token_usage \
+             (session_id, model, token_type, quantity, executed_at, device_id, message_uuid) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?;
+        for ev in events {
+            for (ty, qty) in [
+                ("input", ev.usage.input),
+                ("output", ev.usage.output),
+                ("cache_creation", ev.usage.cache_creation),
+                ("cache_read", ev.usage.cache_read),
+            ] {
+                if qty > 0 {
+                    stmt.execute(params![
+                        session_id,
+                        ev.model,
+                        ty,
+                        qty,
+                        now,
+                        device_label,
+                        ev.uuid,
+                    ])?;
                 }
             }
         }
@@ -226,8 +269,46 @@ fn write_local(
             now,
         ],
     )?;
-    tx.commit()?;
     Ok(())
+}
+
+/// Discover the subagent/workflow transcripts that belong to a main session
+/// transcript. For `.../projects/<proj>/<session>.jsonl` they live under
+/// `.../projects/<proj>/<session>/subagents/` — plain Task subagents directly
+/// inside it, and deep-research / ultracode dynamic workflows nested under
+/// `subagents/workflows/wf_*/` — all named `agent-*.jsonl`. Returns an empty
+/// vec when the directory is absent (the common case for a session that never
+/// spawned a subagent).
+fn subagent_transcripts(main: &Path) -> Vec<PathBuf> {
+    // `<...>/<session>.jsonl` -> `<...>/<session>` -> `<...>/<session>/subagents`
+    let root = main.with_extension("").join("subagents");
+    let mut out = Vec::new();
+    collect_agent_files(&root, &mut out, 0);
+    out
+}
+
+fn collect_agent_files(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
+    // The real tree is at most `subagents/workflows/wf_*/agent-*.jsonl`; bound
+    // recursion so a pathological symlink loop can't wedge the hook.
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        let path = entry.path();
+        if ft.is_dir() {
+            collect_agent_files(&path, out, depth + 1);
+        } else if ft.is_file() {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with("agent-") && name.ends_with(".jsonl") {
+                    out.push(path);
+                }
+            }
+        }
+    }
 }
 
 fn run_retention_cleanup(db: &mut Connection, now: i64) -> Result<()> {
@@ -357,4 +438,65 @@ fn unix_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn unique_tmp(tag: &str) -> PathBuf {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "xcu-test-{}-{}-{}",
+            tag,
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn discovers_plain_and_workflow_subagent_transcripts() {
+        // Mirror the on-disk layout:
+        //   <proj>/<session>.jsonl                                   (main)
+        //   <proj>/<session>/subagents/agent-aaa.jsonl              (Task subagent)
+        //   <proj>/<session>/subagents/workflows/wf_x/agent-bbb.jsonl (workflow)
+        let proj = unique_tmp("layout");
+        let session = "11111111-2222-3333-4444-555555555555";
+        let main = proj.join(format!("{session}.jsonl"));
+        std::fs::write(&main, "{}\n").unwrap();
+
+        let sub = proj.join(session).join("subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("agent-aaa.jsonl"), "{}\n").unwrap();
+
+        let wf = sub.join("workflows").join("wf_deadbeef");
+        std::fs::create_dir_all(&wf).unwrap();
+        std::fs::write(wf.join("agent-bbb.jsonl"), "{}\n").unwrap();
+
+        // Decoys that must NOT be picked up.
+        std::fs::write(sub.join("scratch.jsonl"), "{}\n").unwrap();
+        std::fs::write(sub.join("agent-notes.txt"), "x").unwrap();
+
+        let mut found: Vec<String> = subagent_transcripts(&main)
+            .into_iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        found.sort();
+
+        assert_eq!(found, vec!["agent-aaa.jsonl", "agent-bbb.jsonl"]);
+        std::fs::remove_dir_all(&proj).ok();
+    }
+
+    #[test]
+    fn subagents_dir_absent_yields_empty() {
+        let proj = unique_tmp("empty");
+        let main = proj.join("66666666-7777-8888-9999-000000000000.jsonl");
+        std::fs::write(&main, "{}\n").unwrap();
+        assert!(subagent_transcripts(&main).is_empty());
+        std::fs::remove_dir_all(&proj).ok();
+    }
 }
