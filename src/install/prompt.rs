@@ -55,8 +55,16 @@ impl Tty {
 
 #[cfg(unix)]
 fn open_controlling_tty() -> Option<Tty> {
-    let read = OpenOptions::new().read(true).write(true).open("/dev/tty").ok()?;
-    let write = OpenOptions::new().read(true).write(true).open("/dev/tty").ok()?;
+    let read = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .ok()?;
+    let write = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .ok()?;
     Some(Tty {
         reader: Box::new(BufReader::new(read)),
         writer: Box::new(write),
@@ -65,8 +73,16 @@ fn open_controlling_tty() -> Option<Tty> {
 
 #[cfg(windows)]
 fn open_controlling_tty() -> Option<Tty> {
-    let read = OpenOptions::new().read(true).write(true).open(r"\\.\CON").ok()?;
-    let write = OpenOptions::new().read(true).write(true).open(r"\\.\CON").ok()?;
+    let read = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(r"\\.\CON")
+        .ok()?;
+    let write = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(r"\\.\CON")
+        .ok()?;
     Some(Tty {
         reader: Box::new(BufReader::new(read)),
         writer: Box::new(write),

@@ -344,7 +344,11 @@ mod tests {
         let summary = upsert_hooks(&mut settings, &["Stop"], cmd);
         assert_eq!(summary, vec![("Stop".to_string(), "updated")]);
         let stop = settings["hooks"]["Stop"].as_array().unwrap();
-        assert_eq!(stop.len(), 1, "duplicate XClaude groups should be collapsed");
+        assert_eq!(
+            stop.len(),
+            1,
+            "duplicate XClaude groups should be collapsed"
+        );
     }
 
     #[test]

@@ -141,11 +141,9 @@ pub fn get_or_init_push_cursor(db: &Connection) -> Result<i64> {
         return Ok(v.parse().unwrap_or(0));
     }
     let max: i64 = db
-        .query_row(
-            "SELECT COALESCE(MAX(id), 0) FROM token_usage",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT COALESCE(MAX(id), 0) FROM token_usage", [], |row| {
+            row.get(0)
+        })
         .unwrap_or(0);
     db.execute(
         "INSERT INTO cloud_state (key, value) VALUES ('last_pushed_id', ?1)",

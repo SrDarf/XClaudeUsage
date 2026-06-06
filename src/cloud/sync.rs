@@ -9,9 +9,7 @@ use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
 use super::pipeline::{self, Statement};
-use super::{
-    get_pull_cursor, set_pull_cursor, CloudConfig, PULL_LIMIT, RETENTION_SECONDS,
-};
+use super::{get_pull_cursor, set_pull_cursor, CloudConfig, PULL_LIMIT, RETENTION_SECONDS};
 
 pub fn sync(
     config: &CloudConfig,
@@ -22,9 +20,8 @@ pub fn sync(
     cleanup_due: bool,
 ) -> Result<()> {
     let outbox_rows: Vec<(String, String)> = if do_push {
-        let mut stmt = db.prepare(
-            "SELECT event_id, payload FROM cloud_outbox ORDER BY created_at ASC",
-        )?;
+        let mut stmt =
+            db.prepare("SELECT event_id, payload FROM cloud_outbox ORDER BY created_at ASC")?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -40,7 +37,9 @@ pub fn sync(
 
     // 1. INSERT every outbox row as a token_delta.
     for (event_id, payload) in &outbox_rows {
-        let Ok(p) = serde_json::from_str::<Value>(payload) else { continue };
+        let Ok(p) = serde_json::from_str::<Value>(payload) else {
+            continue;
+        };
         statements.push(Statement {
             sql: "INSERT OR IGNORE INTO token_delta \
                   (device_id, model, event_type, input, output, cache_creation, cache_read, executed_at, event_id) \

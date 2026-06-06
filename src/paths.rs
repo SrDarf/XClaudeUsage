@@ -39,7 +39,6 @@ pub fn settings_path() -> Result<PathBuf> {
 
 pub fn ensure_data_dir() -> Result<()> {
     let dir = data_dir()?;
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     Ok(())
 }

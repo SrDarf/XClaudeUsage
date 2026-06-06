@@ -101,7 +101,10 @@ pub fn execute(
         Ok(r) => r,
         Err(ureq::Error::Status(code, resp)) => {
             let body = resp.into_string().unwrap_or_default();
-            anyhow::bail!("libsql HTTP {code}: {}", body.chars().take(200).collect::<String>());
+            anyhow::bail!(
+                "libsql HTTP {code}: {}",
+                body.chars().take(200).collect::<String>()
+            );
         }
         Err(e) => return Err(e).context("libsql request failed"),
     };
