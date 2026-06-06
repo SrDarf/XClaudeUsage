@@ -30,18 +30,15 @@ pub fn run() -> Result<()> {
     let record_cmd = format!("\"{bin_str}\" record");
 
     let settings_path = paths::settings_path()?;
-    let mut settings = settings::read(&settings_path)
-        .context("reading existing ~/.claude/settings.json")?;
+    let mut settings =
+        settings::read(&settings_path).context("reading existing ~/.claude/settings.json")?;
 
-    match settings::classify_status_line(&settings) {
-        settings::StatusLineState::Foreign => {
-            anyhow::bail!(
-                "a non-XClaude `statusLine` is already configured in {}. \
-                 Refusing to overwrite it. Remove or rename it manually, then re-run.",
-                settings_path.display()
-            );
-        }
-        _ => {}
+    if settings::classify_status_line(&settings) == settings::StatusLineState::Foreign {
+        anyhow::bail!(
+            "a non-XClaude `statusLine` is already configured in {}. \
+             Refusing to overwrite it. Remove or rename it manually, then re-run.",
+            settings_path.display()
+        );
     }
 
     let mut tty = prompt::Tty::open()?;
@@ -51,7 +48,11 @@ pub fn run() -> Result<()> {
 
     let cloud = prompt_cloud(&mut tty)?;
 
-    let events: &[&str] = if cloud.enabled { CLOUD_EVENTS } else { BASE_EVENTS };
+    let events: &[&str] = if cloud.enabled {
+        CLOUD_EVENTS
+    } else {
+        BASE_EVENTS
+    };
 
     let status_action = settings::upsert_status_line(&mut settings, &statusline_cmd);
     let hook_actions = settings::upsert_hooks(&mut settings, events, &record_cmd);
@@ -124,17 +125,28 @@ pub fn doctor() -> Result<()> {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     writeln!(out, "xclaudeusage doctor")?;
-    writeln!(out, "  binary:        {}", std::env::current_exe()?.display())?;
+    writeln!(
+        out,
+        "  binary:        {}",
+        std::env::current_exe()?.display()
+    )?;
     writeln!(out, "  claude_dir:    {}", paths::claude_dir()?.display())?;
     writeln!(out, "  db_path:       {}", paths::db_path()?.display())?;
-    writeln!(out, "  settings_path: {}", paths::settings_path()?.display())?;
+    writeln!(
+        out,
+        "  settings_path: {}",
+        paths::settings_path()?.display()
+    )?;
     writeln!(out, "  log_path:      {}", paths::log_path()?.display())?;
-    writeln!(out, "  cloud_config:  {}", paths::cloud_config_path()?.display())?;
+    writeln!(
+        out,
+        "  cloud_config:  {}",
+        paths::cloud_config_path()?.display()
+    )?;
     let db_path = paths::db_path()?;
     if db_path.exists() {
         let conn = crate::db::open_readonly()?;
-        let count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM token_usage", [], |r| r.get(0))?;
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM token_usage", [], |r| r.get(0))?;
         let cloud_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM cloud_cache", [], |r| r.get(0))
             .unwrap_or(0);
@@ -156,7 +168,10 @@ pub fn uninstall() -> Result<()> {
     let removed = settings::remove_all_xclaude(&mut settings);
     let (changed, backup) = settings::write_if_changed(&settings_path, &settings)?;
     if !changed {
-        println!("[uninstall] no XClaude entries found in {}", settings_path.display());
+        println!(
+            "[uninstall] no XClaude entries found in {}",
+            settings_path.display()
+        );
         return Ok(());
     }
     println!("[uninstall] removed {removed} entries from settings.json");
@@ -196,7 +211,10 @@ fn prompt_cloud(tty: &mut prompt::Tty) -> Result<CloudAnswer> {
             tty.writeln(&format!("  libsql_url: {url}"))?;
             tty.writeln(&format!("  auth_token: {}", prompt::mask_token(token)))?;
             tty.writeln(&format!("  device_id:  {device}"))?;
-            let reuse = tty.ask("Use this existing config? [Y/n]: ")?.trim().to_lowercase();
+            let reuse = tty
+                .ask("Use this existing config? [Y/n]: ")?
+                .trim()
+                .to_lowercase();
             if reuse.is_empty() || reuse == "y" || reuse == "yes" {
                 return Ok(CloudAnswer {
                     enabled: true,

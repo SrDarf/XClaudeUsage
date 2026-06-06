@@ -129,3 +129,133 @@ pub fn parse_assistant_events(text: &str, fallback_model: Option<&str>) -> Vec<A
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    const ASSISTANT_LINE: &str = r#"{"type":"assistant","uuid":"u-1","message":{"id":"m-1","model":"claude-sonnet-4-6","usage":{"input_tokens":10,"output_tokens":20,"cache_creation_input_tokens":5,"cache_read_input_tokens":3}}}"#;
+
+    fn tmp_file(tag: &str, contents: &[u8]) -> std::path::PathBuf {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!(
+            "xcu-transcript-{}-{}-{}.jsonl",
+            tag,
+            std::process::id(),
+            n
+        ));
+        let mut f = File::create(&p).unwrap();
+        f.write_all(contents).unwrap();
+        p
+    }
+
+    #[test]
+    fn parses_assistant_usage_with_model_and_uuid() {
+        let events = parse_assistant_events(ASSISTANT_LINE, None);
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert_eq!(e.model, "claude-sonnet-4-6");
+        assert_eq!(e.uuid.as_deref(), Some("u-1"));
+        assert_eq!(e.usage.input, 10);
+        assert_eq!(e.usage.output, 20);
+        assert_eq!(e.usage.cache_creation, 5);
+        assert_eq!(e.usage.cache_read, 3);
+    }
+
+    #[test]
+    fn skips_non_assistant_blank_and_malformed_lines() {
+        let text = format!(
+            "{}\n{}\n   \n{}\n{}",
+            r#"{"type":"user","message":{"role":"user"}}"#,
+            "not json at all",
+            r#"{"type":"assistant","message":{"model":"m"}}"#, // no usage -> skipped
+            ASSISTANT_LINE,
+        );
+        let events = parse_assistant_events(&text, None);
+        assert_eq!(
+            events.len(),
+            1,
+            "only the well-formed assistant+usage line counts"
+        );
+        assert_eq!(events[0].usage.output, 20);
+    }
+
+    #[test]
+    fn uses_fallback_model_and_message_id_uuid() {
+        // model absent on message -> fallback; uuid absent on raw line -> message.id
+        let line = r#"{"type":"assistant","message":{"id":"m-9","usage":{"output_tokens":7}}}"#;
+        let events = parse_assistant_events(line, Some("fallback-model"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].model, "fallback-model");
+        assert_eq!(events[0].uuid.as_deref(), Some("m-9"));
+        assert_eq!(events[0].usage.output, 7);
+    }
+
+    #[test]
+    fn model_is_unknown_without_model_or_fallback() {
+        let line = r#"{"type":"assistant","message":{"usage":{"output_tokens":1}}}"#;
+        let events = parse_assistant_events(line, None);
+        assert_eq!(events[0].model, "unknown");
+    }
+
+    #[test]
+    fn read_new_returns_complete_lines_and_advances_offset() {
+        let body = "line-a\nline-b\n";
+        let p = tmp_file("complete", body.as_bytes());
+        let r = read_new(&p, 0).unwrap().unwrap();
+        assert_eq!(r.text, "line-a\nline-b");
+        assert_eq!(r.new_offset, body.len() as u64);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn read_new_buffers_partial_trailing_line() {
+        // No trailing newline on the last (partial) line: it must NOT be consumed.
+        let body = "done\npartial-without-newline";
+        let p = tmp_file("partial", body.as_bytes());
+        let r = read_new(&p, 0).unwrap().unwrap();
+        assert_eq!(r.text, "done");
+        assert_eq!(r.new_offset, "done\n".len() as u64);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn read_new_no_newline_yields_empty_without_advancing() {
+        let p = tmp_file("nonl", b"no-newline-yet");
+        let r = read_new(&p, 0).unwrap().unwrap();
+        assert_eq!(r.text, "");
+        assert_eq!(r.new_offset, 0);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn read_new_offset_equals_size_is_noop() {
+        let body = "x\n";
+        let p = tmp_file("eq", body.as_bytes());
+        let r = read_new(&p, body.len() as u64).unwrap().unwrap();
+        assert_eq!(r.text, "");
+        assert_eq!(r.new_offset, body.len() as u64);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn read_new_resets_when_file_shrinks_below_offset() {
+        // Transcript was recreated/truncated: an offset past EOF must reset to 0.
+        let body = "fresh\n";
+        let p = tmp_file("shrink", body.as_bytes());
+        let r = read_new(&p, 9999).unwrap().unwrap();
+        assert_eq!(r.text, "fresh");
+        assert_eq!(r.new_offset, body.len() as u64);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn read_new_missing_file_returns_none() {
+        let p = std::env::temp_dir().join("xcu-transcript-absent-zzz.jsonl");
+        std::fs::remove_file(&p).ok();
+        assert!(read_new(&p, 0).unwrap().is_none());
+    }
+}

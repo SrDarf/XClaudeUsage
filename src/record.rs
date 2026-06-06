@@ -79,8 +79,8 @@ pub fn run() -> Result<()> {
     if input.trim().is_empty() {
         return Ok(());
     }
-    let payload: HookPayload = serde_json::from_str(&input)
-        .context("hook payload is not valid JSON")?;
+    let payload: HookPayload =
+        serde_json::from_str(&input).context("hook payload is not valid JSON")?;
     record(payload)
 }
 
@@ -126,8 +126,7 @@ fn record(payload: HookPayload) -> Result<()> {
     }
 
     // Opportunistic retention cleanup, gated to once per 24h.
-    let cleanup_due =
-        (now - cloud::get_last_cleanup_at(&db)?) >= cloud::CLEANUP_INTERVAL_SECONDS;
+    let cleanup_due = (now - cloud::get_last_cleanup_at(&db)?) >= cloud::CLEANUP_INTERVAL_SECONDS;
     if cleanup_due {
         if let Err(e) = run_retention_cleanup(&mut db, now) {
             crate::log::warn(&format!("retention cleanup failed: {e:#}"));
@@ -314,8 +313,14 @@ fn collect_agent_files(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
 fn run_retention_cleanup(db: &mut Connection, now: i64) -> Result<()> {
     let cutoff = now - cloud::RETENTION_SECONDS;
     let tx = db.transaction()?;
-    tx.execute("DELETE FROM token_usage WHERE executed_at < ?1", params![cutoff])?;
-    tx.execute("DELETE FROM cloud_cache WHERE executed_at < ?1", params![cutoff])?;
+    tx.execute(
+        "DELETE FROM token_usage WHERE executed_at < ?1",
+        params![cutoff],
+    )?;
+    tx.execute(
+        "DELETE FROM cloud_cache WHERE executed_at < ?1",
+        params![cutoff],
+    )?;
     tx.execute(
         "INSERT INTO cloud_state (key, value) VALUES ('last_cleanup_at', ?1) \
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -335,7 +340,9 @@ fn enqueue_outbox(
     event_type: Option<&str>,
     now: i64,
 ) -> Result<()> {
-    let Some(event_type) = event_type else { return Ok(()) };
+    let Some(event_type) = event_type else {
+        return Ok(());
+    };
     let last_pushed = cloud::get_or_init_push_cursor(db)?;
     let window_start = now - cloud::RETENTION_SECONDS;
 
@@ -445,17 +452,143 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    const EV1: &str = r#"{"type":"assistant","uuid":"uuid-1","message":{"model":"claude-x","usage":{"input_tokens":10,"output_tokens":20,"cache_creation_input_tokens":5,"cache_read_input_tokens":3}}}"#;
+    const EV2: &str = r#"{"type":"assistant","uuid":"uuid-2","message":{"model":"claude-x","usage":{"output_tokens":40}}}"#;
+
     fn unique_tmp(tag: &str) -> PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "xcu-test-{}-{}-{}",
-            tag,
-            std::process::id(),
-            n
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("xcu-test-{}-{}-{}", tag, std::process::id(), n));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn mem_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        db::schema::migrate(&conn).unwrap();
+        conn
+    }
+
+    fn write_transcript(dir: &Path, name: &str, contents: &str) -> PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, contents).unwrap();
+        p
+    }
+
+    fn sum_quantity(db: &Connection, ty: &str) -> i64 {
+        db.query_row(
+            "SELECT COALESCE(SUM(quantity), 0) FROM token_usage WHERE token_type = ?1",
+            params![ty],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn row_count(db: &Connection) -> i64 {
+        db.query_row("SELECT COUNT(*) FROM token_usage", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn write_local_ingests_main_transcript_tokens() {
+        let dir = unique_tmp("ingest");
+        let main = write_transcript(&dir, "session.jsonl", &format!("{EV1}\n"));
+        let mut db = mem_db();
+        write_local(&mut db, "sess", &main, None, "dev", 1234).unwrap();
+
+        assert_eq!(sum_quantity(&db, "input"), 10);
+        assert_eq!(sum_quantity(&db, "output"), 20);
+        assert_eq!(sum_quantity(&db, "cache_creation"), 5);
+        assert_eq!(sum_quantity(&db, "cache_read"), 3);
+        assert_eq!(row_count(&db), 4, "one row per non-zero token type");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_local_skips_zero_quantity_token_types() {
+        let dir = unique_tmp("zero");
+        let main = write_transcript(&dir, "session.jsonl", &format!("{EV2}\n"));
+        let mut db = mem_db();
+        write_local(&mut db, "sess", &main, None, "dev", 1).unwrap();
+        assert_eq!(row_count(&db), 1, "only the non-zero output row is written");
+        assert_eq!(sum_quantity(&db, "output"), 40);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_local_is_incremental_and_idempotent() {
+        let dir = unique_tmp("incr");
+        let main = write_transcript(&dir, "session.jsonl", &format!("{EV1}\n"));
+        let mut db = mem_db();
+
+        // First pass ingests EV1.
+        write_local(&mut db, "sess", &main, None, "dev", 1).unwrap();
+        // Re-running with no new bytes must add nothing (offset == size).
+        write_local(&mut db, "sess", &main, None, "dev", 2).unwrap();
+        assert_eq!(row_count(&db), 4, "no duplicate rows on a no-op re-run");
+
+        // Appending a new event ingests only the delta.
+        std::fs::write(&main, format!("{EV1}\n{EV2}\n")).unwrap();
+        write_local(&mut db, "sess", &main, None, "dev", 3).unwrap();
+        assert_eq!(sum_quantity(&db, "output"), 60, "20 from EV1 + 40 from EV2");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_local_advances_byte_offset() {
+        let dir = unique_tmp("offset");
+        let body = format!("{EV1}\n");
+        let main = write_transcript(&dir, "session.jsonl", &body);
+        let mut db = mem_db();
+        write_local(&mut db, "sess", &main, None, "dev", 1).unwrap();
+        let offset: i64 = db
+            .query_row(
+                "SELECT byte_offset FROM transcript_progress WHERE transcript_path = ?1",
+                params![main.to_string_lossy()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(offset, body.len() as i64);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_local_ingests_subagent_transcripts() {
+        let dir = unique_tmp("subingest");
+        let main = write_transcript(&dir, "session.jsonl", &format!("{EV1}\n"));
+        // Sibling subagent tree: <dir>/session/subagents/agent-a.jsonl
+        let sub = dir.join("session").join("subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("agent-a.jsonl"), format!("{EV2}\n")).unwrap();
+
+        let mut db = mem_db();
+        write_local(&mut db, "sess", &main, None, "dev", 1).unwrap();
+        // EV1 output 20 (main) + EV2 output 40 (subagent) = 60.
+        assert_eq!(sum_quantity(&db, "output"), 60);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ingest_dedupes_duplicate_message_uuid() {
+        let dir = unique_tmp("dedup");
+        let main = write_transcript(&dir, "session.jsonl", &format!("{EV1}\n"));
+        // A second transcript carrying the SAME message uuid as EV1.
+        let other = write_transcript(&dir, "other.jsonl", &format!("{EV1}\n"));
+        let mut db = mem_db();
+        {
+            let tx = db.transaction().unwrap();
+            ingest_transcript(&tx, "sess", &main, None, "dev", 1).unwrap();
+            ingest_transcript(&tx, "sess", &other, None, "dev", 1).unwrap();
+            tx.commit().unwrap();
+        }
+        // The unique (message_uuid, token_type) index dedupes the second file's rows.
+        assert_eq!(
+            sum_quantity(&db, "output"),
+            20,
+            "duplicate uuid not double-counted"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

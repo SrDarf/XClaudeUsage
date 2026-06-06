@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::db;
@@ -203,7 +203,9 @@ fn write_seven_day_window(sd: Option<Window>) -> Result<()> {
 
 fn read_window_tokens(fh: Option<Window>) -> Result<Option<Totals>> {
     let Some(fh) = fh else { return Ok(None) };
-    let Some(resets_at) = fh.resets_at else { return Ok(None) };
+    let Some(resets_at) = fh.resets_at else {
+        return Ok(None);
+    };
     let path = paths::db_path()?;
     if !path.exists() {
         return Ok(None);
@@ -212,6 +214,14 @@ fn read_window_tokens(fh: Option<Window>) -> Result<Option<Totals>> {
     let start = end - 5 * 3600;
 
     let conn = db::open_readonly()?;
+    query_window_tokens(&conn, start, end)
+}
+
+/// Sum `token_usage` + `cloud_cache` rows whose `executed_at` falls in the
+/// half-open window `[start, end)`. Split out from `read_window_tokens` so the
+/// boundary logic is unit-testable against an in-memory DB without touching the
+/// real db path.
+fn query_window_tokens(conn: &Connection, start: i64, end: i64) -> Result<Option<Totals>> {
     let mut totals = Totals::default();
     let mut any_rows = false;
 
@@ -302,7 +312,9 @@ fn read_session_tokens(transcript_path: Option<&str>, session: &str) -> Option<T
     }
     let subagent_dir: PathBuf = {
         // strip_suffix mirrors the JS regex /\.jsonl$/ (at-end, once).
-        let s = transcript_path.strip_suffix(".jsonl").unwrap_or(transcript_path);
+        let s = transcript_path
+            .strip_suffix(".jsonl")
+            .unwrap_or(transcript_path);
         PathBuf::from(format!("{s}/subagents"))
     };
     if subagent_dir.exists() {
@@ -336,7 +348,7 @@ fn read_session_tokens(transcript_path: Option<&str>, session: &str) -> Option<T
     }
 
     let mut total = Totals::default();
-    for (_p, e) in &cache.files {
+    for e in cache.files.values() {
         total.input += e.input;
         total.output += e.output;
         total.cache_creation += e.cache_creation;
@@ -354,7 +366,9 @@ fn consume_transcript(path: &Path, entry: &mut LegacyEntry) {
     if entry.offset == size {
         return;
     }
-    let Ok(mut f) = fs::File::open(path) else { return };
+    let Ok(mut f) = fs::File::open(path) else {
+        return;
+    };
     use std::io::Seek;
     if f.seek(io::SeekFrom::Start(entry.offset)).is_err() {
         return;
@@ -364,7 +378,9 @@ fn consume_transcript(path: &Path, entry: &mut LegacyEntry) {
         return;
     }
     let text = String::from_utf8_lossy(&buf);
-    let Some(last_nl) = text.rfind('\n') else { return };
+    let Some(last_nl) = text.rfind('\n') else {
+        return;
+    };
     let process = &text[..last_nl];
     let consumed = (last_nl as u64) + 1;
     for ev in transcript::parse_assistant_events(process, None) {
@@ -380,7 +396,11 @@ fn consume_transcript(path: &Path, entry: &mut LegacyEntry) {
 // Formatting helpers — bit-identical to xclaude-usage.js.
 
 fn fmt_countdown(resets_at: i64) -> String {
-    let secs_left = (resets_at - unix_now()).max(0);
+    fmt_countdown_secs(resets_at - unix_now())
+}
+
+fn fmt_countdown_secs(secs_left: i64) -> String {
+    let secs_left = secs_left.max(0);
     let h = secs_left / 3600;
     let m = (secs_left % 3600) / 60;
     let s = secs_left % 60;
@@ -411,4 +431,144 @@ fn unix_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn win(resets_at: Option<i64>, pct: Option<f64>) -> Window {
+        Window {
+            resets_at,
+            used_percentage: pct,
+        }
+    }
+
+    fn out_totals(output: i64) -> Totals {
+        Totals {
+            input: 0,
+            output,
+            cache_creation: 0,
+            cache_read: 0,
+        }
+    }
+
+    #[test]
+    fn fmt_tokens_scales_by_magnitude() {
+        assert_eq!(fmt_tokens(0), "0");
+        assert_eq!(fmt_tokens(999), "999");
+        assert_eq!(fmt_tokens(1_000), "1.0k");
+        assert_eq!(fmt_tokens(427_000), "427.0k");
+        assert_eq!(fmt_tokens(1_000_000), "1.00M");
+        assert_eq!(fmt_tokens(2_500_000), "2.50M");
+    }
+
+    #[test]
+    fn fmt_countdown_secs_formats_units_and_clamps_negative() {
+        assert_eq!(fmt_countdown_secs(-10), "0s");
+        assert_eq!(fmt_countdown_secs(0), "0s");
+        assert_eq!(fmt_countdown_secs(5), "5s");
+        assert_eq!(fmt_countdown_secs(65), "1m05s");
+        assert_eq!(fmt_countdown_secs(3600), "1h00m");
+        assert_eq!(fmt_countdown_secs(3661), "1h01m");
+        assert_eq!(fmt_countdown_secs(7322), "2h02m");
+    }
+
+    #[test]
+    fn render_extrapolates_real_limit_from_percentage() {
+        // 300k output reported at 50% -> implied 5h limit of 600k.
+        let seg = render_token_segment(Some(win(None, Some(50.0))), Some(&out_totals(300_000)));
+        assert!(seg.contains("out:300.0k/600.0k"), "got: {seg}");
+        assert!(seg.contains("50%"), "got: {seg}");
+        // 50 lands in the 50..65 band -> yellow "33".
+        assert!(seg.contains("\x1b[33m"), "expected yellow band, got: {seg}");
+        // bar: 5 filled, 5 empty.
+        assert!(seg.contains("█████░░░░░"), "got: {seg}");
+    }
+
+    #[test]
+    fn render_color_bands_track_percentage() {
+        assert!(render_token_segment(Some(win(None, Some(30.0))), None).contains("\x1b[32m"));
+        assert!(render_token_segment(Some(win(None, Some(70.0))), None).contains("\x1b[38;5;208m"));
+        assert!(render_token_segment(Some(win(None, Some(90.0))), None).contains("\x1b[31m"));
+    }
+
+    #[test]
+    fn render_drops_limit_when_percentage_is_zero() {
+        // pct_raw == 0 -> no divide, show the bare out:X label.
+        let seg = render_token_segment(Some(win(None, Some(0.0))), Some(&out_totals(427_000)));
+        assert!(seg.contains("out:427.0k ·"), "got: {seg}");
+        assert!(
+            !seg.contains('/'),
+            "no extrapolated limit when pct is 0: {seg}"
+        );
+    }
+
+    #[test]
+    fn render_legacy_segment_without_window() {
+        // No five-hour window, but session tokens exist -> bare out: label.
+        let seg = render_token_segment(None, Some(&out_totals(12_345)));
+        assert_eq!(seg, " │ \x1b[2mout:12.3k\x1b[0m");
+    }
+
+    #[test]
+    fn render_empty_when_no_window_and_no_output() {
+        assert_eq!(render_token_segment(None, None), "");
+        assert_eq!(render_token_segment(None, Some(&out_totals(0))), "");
+    }
+
+    #[test]
+    fn query_window_tokens_respects_half_open_boundary() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::migrate(&conn).unwrap();
+        let start = 1_000_000i64;
+        let end = start + 5 * 3600;
+        let insert = |at: i64, qty: i64| {
+            conn.execute(
+                "INSERT INTO token_usage (session_id, model, token_type, quantity, executed_at) \
+                 VALUES ('s','m','output',?1,?2)",
+                params![qty, at],
+            )
+            .unwrap();
+        };
+        insert(start - 1, 1); // before window -> excluded
+        insert(start, 10); // >= start -> included
+        insert(end - 1, 100); // < end -> included
+        insert(end, 1000); // == end -> excluded (half-open)
+
+        let totals = query_window_tokens(&conn, start, end).unwrap().unwrap();
+        assert_eq!(totals.output, 110, "only [start, end) rows are summed");
+    }
+
+    #[test]
+    fn query_window_tokens_includes_cloud_cache() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::migrate(&conn).unwrap();
+        let start = 2_000_000i64;
+        let end = start + 5 * 3600;
+        conn.execute(
+            "INSERT INTO token_usage (session_id, model, token_type, quantity, executed_at) \
+             VALUES ('s','m','output',5,?1)",
+            params![start + 1],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cloud_cache (remote_id, device_id, model, output, executed_at) \
+             VALUES (1,'d','m',7,?1)",
+            params![start + 2],
+        )
+        .unwrap();
+        let totals = query_window_tokens(&conn, start, end).unwrap().unwrap();
+        assert_eq!(
+            totals.output, 12,
+            "local token_usage + cloud_cache combined"
+        );
+    }
+
+    #[test]
+    fn query_window_tokens_is_none_when_empty() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::migrate(&conn).unwrap();
+        assert!(query_window_tokens(&conn, 0, 100).unwrap().is_none());
+    }
 }
