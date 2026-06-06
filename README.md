@@ -169,7 +169,7 @@ Then point `settings.json` at the resolved path (`mise which xclaudeusage`) or s
 
 ### Arch Linux (AUR)
 
-An `xclaudeusage-bin` package (prebuilt binary, SHA-256 verified) can be installed with an AUR helper once published:
+An [`xclaudeusage-bin`](https://aur.archlinux.org/packages/xclaudeusage-bin) package (prebuilt binary, SHA-256 verified) is available with any AUR helper:
 
 ```bash
 yay -S xclaudeusage-bin
