@@ -152,6 +152,31 @@ cargo install --git https://github.com/SrDarf/XClaudeUsage --branch HighPerforma
 
 Either way the binary lands at `~/.cargo/bin/xclaudeusage`. Symlink it into `~/.claude/bin/` (or update `settings.json` to point at the cargo location) and run `xclaudeusage install`.
 
+### Alternative: `mise`
+
+[mise](https://mise.jdx.dev) can install and version-pin `xclaudeusage` directly:
+
+```bash
+# Pre-built release binary (no Rust toolchain); matches your OS/arch against the
+# published release archives:
+mise use -g ubi:SrDarf/XClaudeUsage
+
+# Or build the crates.io release from source:
+mise use -g cargo:xclaudeusage
+```
+
+Then point `settings.json` at the resolved path (`mise which xclaudeusage`) or symlink it into `~/.claude/bin/`, and run `xclaudeusage install`.
+
+### Arch Linux (AUR)
+
+An `xclaudeusage-bin` package (prebuilt binary, SHA-256 verified) can be installed with an AUR helper once published:
+
+```bash
+yay -S xclaudeusage-bin
+```
+
+The packaging source lives in [`packaging/aur/`](packaging/aur/).
+
 ---
 
 ## Multi-session
