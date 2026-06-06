@@ -120,7 +120,7 @@ Grab the right archive for your platform from [the latest release](https://githu
 | macOS Apple Silicon | `xclaudeusage-aarch64-apple-darwin.tar.gz` |
 | Windows x86_64 | `xclaudeusage-x86_64-pc-windows-msvc.zip` |
 
-> **Intel Mac users:** there's no pre-built binary because GitHub's `macos-13` runners are unreliable for releases. Use `cargo install` (see below) — it builds cleanly under Rosetta or natively on Intel.
+> **Intel Mac users:** there's no pre-built binary (GitHub's `macos-13` runners are unreliable for releases), so install via `cargo install` (see below); it compiles natively on Intel or under Rosetta.
 
 Extract `xclaudeusage` (or `xclaudeusage.exe`) and place it at `~/.claude/bin/xclaudeusage` (Linux/macOS) or `%USERPROFILE%\.claude\bin\xclaudeusage.exe` (Windows). Make it executable: `chmod +x ~/.claude/bin/xclaudeusage`.
 
@@ -138,13 +138,19 @@ Done.
 
 ### Alternative: `cargo install`
 
-If you have a Rust toolchain (≥ 1.74), build from source:
+If you have a Rust toolchain (≥ 1.74), install the latest release from [crates.io](https://crates.io/crates/xclaudeusage) (compiled from source for your platform, so it also covers targets without a pre-built binary, like Intel Mac):
+
+```bash
+cargo install xclaudeusage
+```
+
+Or build the latest unreleased code straight from this branch:
 
 ```bash
 cargo install --git https://github.com/SrDarf/XClaudeUsage --branch HighPerformanceXClaudeUsage --locked
 ```
 
-The binary lands at `~/.cargo/bin/xclaudeusage`. Symlink it into `~/.claude/bin/` (or update `settings.json` to point at the cargo location) and run `xclaudeusage install`.
+Either way the binary lands at `~/.cargo/bin/xclaudeusage`. Symlink it into `~/.claude/bin/` (or update `settings.json` to point at the cargo location) and run `xclaudeusage install`.
 
 ---
 
