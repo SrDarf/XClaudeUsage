@@ -7,7 +7,7 @@
 // attached (e.g. when the user runs `xclaudeusage install` themselves).
 
 use std::fs::OpenOptions;
-use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 
 use anyhow::Result;
 
@@ -100,17 +100,7 @@ pub fn mask_token(token: &str) -> String {
         return "***".to_string();
     }
     let prefix: String = token.chars().take(8).collect();
-    let suffix: String = token
-        .chars()
-        .rev()
-        .take(4)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
+    let n = token.chars().count();
+    let suffix: String = token.chars().skip(n.saturating_sub(4)).collect();
     format!("{prefix}…{suffix} ({} chars)", token.len())
 }
-
-// Silence unused-warning when neither Read nor BufRead callers are present.
-#[allow(dead_code)]
-fn _force_read_import(_r: &mut dyn Read) {}

@@ -14,9 +14,7 @@ pub fn data_dir() -> Result<PathBuf> {
     Ok(claude_dir()?.join("data"))
 }
 
-// hooks_dir is referenced by the installer (task #6) when offering to remove
-// legacy ~/.claude/hooks/xclaude-*.js files after a migration.
-#[allow(dead_code)]
+// Used by the migrator to remove legacy ~/.claude/hooks/xclaude-*.js files.
 pub fn hooks_dir() -> Result<PathBuf> {
     Ok(claude_dir()?.join("hooks"))
 }

@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -10,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db;
 use crate::paths;
+use crate::time::unix_now;
 use crate::transcript;
 
 #[derive(Deserialize, Default)]
@@ -85,12 +85,22 @@ pub fn run() -> Result<()> {
 
     let five_hour = payload.rate_limits.as_ref().and_then(|r| r.five_hour);
     let seven_day = payload.rate_limits.as_ref().and_then(|r| r.seven_day);
-    let _ = write_five_hour_window(five_hour);
-    let _ = write_seven_day_window(seven_day);
 
-    let tokens = read_window_tokens(five_hour)
-        .ok()
-        .flatten()
+    // One writable connection for the whole render (it migrates once); both
+    // window upserts and the token read share it. Absent DB → None, and we fall
+    // back to the legacy transcript reader below.
+    let conn = match paths::db_path() {
+        Ok(p) if p.exists() => db::open().ok(),
+        _ => None,
+    };
+    if let Some(conn) = conn.as_ref() {
+        let _ = write_window(conn, five_hour, "five_hour_window", "start_at", 5 * 3600);
+        let _ = write_window(conn, seven_day, "seven_day_window", "starts_at", 7 * 24 * 3600);
+    }
+
+    let tokens = conn
+        .as_ref()
+        .and_then(|conn| read_window_tokens(conn, five_hour).ok().flatten())
         .or_else(|| read_session_tokens(payload.transcript_path.as_deref(), &session));
 
     let token_str = render_token_segment(five_hour, tokens.as_ref());
@@ -151,70 +161,44 @@ fn render_token_segment(five_hour: Option<Window>, tokens: Option<&Totals>) -> S
     String::new()
 }
 
-fn write_five_hour_window(fh: Option<Window>) -> Result<()> {
-    let Some(fh) = fh else { return Ok(()) };
-    let (Some(resets_at), Some(used)) = (fh.resets_at, fh.used_percentage) else {
+/// Upsert the singleton rate-limit window row for `table`. `start_col` is the
+/// table's window-start column (`start_at` / `starts_at`) and `window_secs` the
+/// window length — both fixed constants, never user input (no injection risk in
+/// the `format!`ed SQL).
+fn write_window(
+    conn: &Connection,
+    window: Option<Window>,
+    table: &str,
+    start_col: &str,
+    window_secs: i64,
+) -> Result<()> {
+    let Some(window) = window else { return Ok(()) };
+    let (Some(resets_at), Some(used)) = (window.resets_at, window.used_percentage) else {
         return Ok(());
     };
-    let path = paths::db_path()?;
-    if !path.exists() {
-        return Ok(());
-    }
-    let conn = db::open()?;
-    let start_at = resets_at - 5 * 3600;
+    let start = resets_at - window_secs;
     let now = unix_now();
-    conn.execute(
-        "INSERT INTO five_hour_window (id, resets_at, start_at, used_percentage, updated_at) \
+    let sql = format!(
+        "INSERT INTO {table} (id, resets_at, {start_col}, used_percentage, updated_at) \
          VALUES (1, ?1, ?2, ?3, ?4) \
          ON CONFLICT(id) DO UPDATE SET \
            resets_at = excluded.resets_at, \
-           start_at = excluded.start_at, \
+           {start_col} = excluded.{start_col}, \
            used_percentage = excluded.used_percentage, \
-           updated_at = excluded.updated_at",
-        params![resets_at, start_at, used, now],
-    )?;
+           updated_at = excluded.updated_at"
+    );
+    conn.execute(&sql, params![resets_at, start, used, now])?;
     Ok(())
 }
 
-fn write_seven_day_window(sd: Option<Window>) -> Result<()> {
-    let Some(sd) = sd else { return Ok(()) };
-    let (Some(resets_at), Some(used)) = (sd.resets_at, sd.used_percentage) else {
-        return Ok(());
-    };
-    let path = paths::db_path()?;
-    if !path.exists() {
-        return Ok(());
-    }
-    let conn = db::open()?;
-    let starts_at = resets_at - 7 * 24 * 3600;
-    let now = unix_now();
-    conn.execute(
-        "INSERT INTO seven_day_window (id, resets_at, starts_at, used_percentage, updated_at) \
-         VALUES (1, ?1, ?2, ?3, ?4) \
-         ON CONFLICT(id) DO UPDATE SET \
-           resets_at = excluded.resets_at, \
-           starts_at = excluded.starts_at, \
-           used_percentage = excluded.used_percentage, \
-           updated_at = excluded.updated_at",
-        params![resets_at, starts_at, used, now],
-    )?;
-    Ok(())
-}
-
-fn read_window_tokens(fh: Option<Window>) -> Result<Option<Totals>> {
+fn read_window_tokens(conn: &Connection, fh: Option<Window>) -> Result<Option<Totals>> {
     let Some(fh) = fh else { return Ok(None) };
     let Some(resets_at) = fh.resets_at else {
         return Ok(None);
     };
-    let path = paths::db_path()?;
-    if !path.exists() {
-        return Ok(None);
-    }
     let end = resets_at;
     let start = end - 5 * 3600;
-
-    let conn = db::open_readonly()?;
-    query_window_tokens(&conn, start, end)
+    query_window_tokens(conn, start, end)
 }
 
 /// Sum `token_usage` + `cloud_cache` rows whose `executed_at` falls in the
@@ -424,13 +408,6 @@ fn fmt_tokens(n: i64) -> String {
         return format!("{:.1}k", (n as f64) / 1_000.0);
     }
     format!("{:.2}M", (n as f64) / 1_000_000.0)
-}
-
-fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

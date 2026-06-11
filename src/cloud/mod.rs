@@ -106,23 +106,35 @@ pub fn resolve_device_id(db: &Connection, config_device_id: Option<&str>) -> Res
     Ok(stored)
 }
 
-pub fn get_pull_cursor(db: &Connection) -> Result<i64> {
+/// Read an i64 stored as text in `cloud_state`; 0 if the key is absent or
+/// unparseable. All `cloud_state` integer cursors go through this.
+fn cloud_state_get_i64(db: &Connection, key: &str) -> Result<i64> {
     let v: Option<String> = db
         .query_row(
-            "SELECT value FROM cloud_state WHERE key = 'last_remote_id'",
-            [],
+            "SELECT value FROM cloud_state WHERE key = ?1",
+            params![key],
             |row| row.get(0),
         )
         .optional()?;
     Ok(v.and_then(|s| s.parse().ok()).unwrap_or(0))
 }
 
-pub fn set_pull_cursor(db: &Connection, id: i64) -> Result<()> {
+/// Upsert an i64 (stored as text) into `cloud_state`.
+fn cloud_state_set_i64(db: &Connection, key: &str, value: i64) -> Result<()> {
     db.execute(
-        "INSERT INTO cloud_state (key, value) VALUES ('last_remote_id', ?1)\n         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![id.to_string()],
+        "INSERT INTO cloud_state (key, value) VALUES (?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value.to_string()],
     )?;
     Ok(())
+}
+
+pub fn get_pull_cursor(db: &Connection) -> Result<i64> {
+    cloud_state_get_i64(db, "last_remote_id")
+}
+
+pub fn set_pull_cursor(db: &Connection, id: i64) -> Result<()> {
+    cloud_state_set_i64(db, "last_remote_id", id)
 }
 
 /// `last_pushed_id` initialization: on first read for a fresh install, seed it
@@ -145,36 +157,18 @@ pub fn get_or_init_push_cursor(db: &Connection) -> Result<i64> {
             row.get(0)
         })
         .unwrap_or(0);
-    db.execute(
-        "INSERT INTO cloud_state (key, value) VALUES ('last_pushed_id', ?1)",
-        params![max.to_string()],
-    )?;
+    cloud_state_set_i64(db, "last_pushed_id", max)?;
     Ok(max)
 }
 
 pub fn set_push_cursor(db: &Connection, id: i64) -> Result<()> {
-    db.execute(
-        "INSERT INTO cloud_state (key, value) VALUES ('last_pushed_id', ?1)\n         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![id.to_string()],
-    )?;
-    Ok(())
+    cloud_state_set_i64(db, "last_pushed_id", id)
 }
 
 pub fn get_last_cleanup_at(db: &Connection) -> Result<i64> {
-    let v: Option<String> = db
-        .query_row(
-            "SELECT value FROM cloud_state WHERE key = 'last_cleanup_at'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(v.and_then(|s| s.parse().ok()).unwrap_or(0))
+    cloud_state_get_i64(db, "last_cleanup_at")
 }
 
 pub fn set_last_cleanup_at(db: &Connection, ts: i64) -> Result<()> {
-    db.execute(
-        "INSERT INTO cloud_state (key, value) VALUES ('last_cleanup_at', ?1)\n         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![ts.to_string()],
-    )?;
-    Ok(())
+    cloud_state_set_i64(db, "last_cleanup_at", ts)
 }

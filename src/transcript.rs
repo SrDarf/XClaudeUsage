@@ -81,18 +81,19 @@ pub fn read_new(path: &Path, offset: u64) -> Result<Option<ReadResult>> {
     let mut buf = Vec::with_capacity((size - offset) as usize);
     f.take(size - offset).read_to_end(&mut buf)?;
 
-    let text = String::from_utf8_lossy(&buf).into_owned();
-    let Some(last_nl) = text.rfind('\n') else {
+    // Find the last newline at the byte level (newline is ASCII, so this is
+    // safe regardless of UTF-8 boundaries), keep only the complete lines, and
+    // decode once — avoids decoding the whole tail and then re-copying a slice.
+    let Some(last_nl) = buf.iter().rposition(|&b| b == b'\n') else {
         return Ok(Some(ReadResult {
             text: String::new(),
             new_offset: offset,
         }));
     };
-
-    let process = text[..last_nl].to_string();
+    buf.truncate(last_nl);
     offset += (last_nl as u64) + 1;
     Ok(Some(ReadResult {
-        text: process,
+        text: String::from_utf8_lossy(&buf).into_owned(),
         new_offset: offset,
     }))
 }
@@ -100,7 +101,11 @@ pub fn read_new(path: &Path, offset: u64) -> Result<Option<ReadResult>> {
 pub fn parse_assistant_events(text: &str, fallback_model: Option<&str>) -> Vec<AssistantEvent> {
     let mut out = Vec::new();
     for line in text.split('\n') {
-        if line.trim().is_empty() {
+        // Cheap pre-filter: only `assistant` lines carry usage and they're a
+        // minority of the transcript, so skip the full JSON parse for the rest
+        // (this also drops blank lines). The `raw.ty` check below stays as the
+        // authoritative filter — the substring can appear in other line types.
+        if !line.contains("\"assistant\"") {
             continue;
         }
         let Ok(raw) = serde_json::from_str::<RawLine>(line) else {

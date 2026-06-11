@@ -1,6 +1,5 @@
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -9,6 +8,7 @@ use uuid::Uuid;
 
 use crate::cloud;
 use crate::db;
+use crate::time::unix_now;
 use crate::transcript;
 
 /// Per-hook capabilities. Source of truth — matches xclaude-record.js:HOOK_BEHAVIOR.
@@ -321,11 +321,7 @@ fn run_retention_cleanup(db: &mut Connection, now: i64) -> Result<()> {
         "DELETE FROM cloud_cache WHERE executed_at < ?1",
         params![cutoff],
     )?;
-    tx.execute(
-        "INSERT INTO cloud_state (key, value) VALUES ('last_cleanup_at', ?1) \
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![now.to_string()],
-    )?;
+    cloud::set_last_cleanup_at(&tx, now)?;
     tx.commit()?;
     Ok(())
 }
@@ -406,11 +402,7 @@ fn enqueue_outbox(
         |row| row.get(0),
     )?;
     if new_cursor > last_pushed {
-        tx.execute(
-            "INSERT INTO cloud_state (key, value) VALUES ('last_pushed_id', ?1) \
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![new_cursor.to_string()],
-        )?;
+        cloud::set_push_cursor(&tx, new_cursor)?;
     }
     tx.commit()?;
     Ok(())
@@ -438,13 +430,6 @@ fn hostname() -> String {
             }
         })
         .unwrap_or_default()
-}
-
-fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

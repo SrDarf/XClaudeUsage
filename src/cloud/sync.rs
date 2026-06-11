@@ -2,14 +2,13 @@
 // other devices' deltas into cloud_cache, and (when due) prune rows older
 // than RETENTION_SECONDS. Mirrors xclaude-record.js:syncCloud.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use anyhow::Result;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
 use super::pipeline::{self, Statement};
 use super::{get_pull_cursor, set_pull_cursor, CloudConfig, PULL_LIMIT, RETENTION_SECONDS};
+use crate::time::unix_now;
 
 pub fn sync(
     config: &CloudConfig,
@@ -154,11 +153,4 @@ pub fn sync(
             Err(e)
         }
     }
-}
-
-fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }

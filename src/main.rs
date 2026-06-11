@@ -6,6 +6,7 @@ mod log;
 mod paths;
 mod record;
 mod statusline;
+mod time;
 mod transcript;
 
 use clap::Parser;
