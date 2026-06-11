@@ -9,14 +9,23 @@ branch. The original Node.js implementation lives on `main`.
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-06-11
+
 ### Added
 - `mise` install path: `mise use -g ubi:SrDarf/XClaudeUsage` (pre-built binary)
   or `mise use -g cargo:xclaudeusage` (crates.io build).
-- AUR packaging under `packaging/aur/` for an `xclaudeusage-bin` package.
+- AUR packaging under `packaging/aur/` for an `xclaudeusage-bin` package
+  ([xclaudeusage-bin](https://aur.archlinux.org/packages/xclaudeusage-bin)).
 - `docs/ARCHITECTURE.md` covering the incremental parser, the 5-hour window
   model, subagent/workflow ingestion, and cloud idempotency.
 - This changelog. Release notes are now generated from it instead of GitHub's
   auto-generated notes.
+
+### Changed
+- Internal quality pass (no behavior change): shared time helpers in a single
+  module, parameterized `cloud_state` accessors, one DB connection per
+  statusline render (was 3 opens + 2 migrations), a substring pre-filter
+  before full JSON parsing of transcript lines, and dead-code removal.
 
 ## [0.1.4] - 2026-06-06
 
@@ -69,7 +78,8 @@ branch. The original Node.js implementation lives on `main`.
   merge with a backup, SHA-256 verified downloads, and migration of the legacy
   Node hook entries.
 
-[Unreleased]: https://github.com/SrDarf/XClaudeUsage/compare/v0.1.4...HighPerformanceXClaudeUsage
+[Unreleased]: https://github.com/SrDarf/XClaudeUsage/compare/v0.1.5...HighPerformanceXClaudeUsage
+[0.1.5]: https://github.com/SrDarf/XClaudeUsage/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/SrDarf/XClaudeUsage/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/SrDarf/XClaudeUsage/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/SrDarf/XClaudeUsage/compare/v0.1.1...v0.1.2
