@@ -127,10 +127,16 @@ pub fn execute(
         }
         out.push(item.response.and_then(decode_response));
     }
-    // If the server returned fewer results than expected, pad with None so
-    // indices into `out` remain meaningful.
-    while out.len() < statements.len() {
-        out.push(None);
+    // Fewer results than statements means the server did NOT execute the
+    // missing ones. Treating them as success would let callers discard
+    // un-synced data (e.g. delete outbox rows that never reached token_delta),
+    // so this is an error, not something to pad over.
+    if out.len() < statements.len() {
+        anyhow::bail!(
+            "libsql returned {} results for {} statements",
+            out.len(),
+            statements.len()
+        );
     }
     Ok(out)
 }

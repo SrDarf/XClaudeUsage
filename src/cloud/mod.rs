@@ -21,6 +21,10 @@ pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(5);
 pub const PULL_LIMIT: i64 = 500;
 pub const RETENTION_SECONDS: i64 = 15 * 24 * 3600;
 pub const CLEANUP_INTERVAL_SECONDS: i64 = 24 * 3600;
+/// Minimum gap between pulls. PostToolUse fires on every tool call; without
+/// this gate each one would pay a blocking network roundtrip for a SELECT that
+/// almost never has new rows between consecutive calls.
+pub const PULL_INTERVAL_SECONDS: i64 = 60;
 
 #[derive(Debug, Clone)]
 pub struct CloudConfig {
@@ -171,4 +175,38 @@ pub fn get_last_cleanup_at(db: &Connection) -> Result<i64> {
 
 pub fn set_last_cleanup_at(db: &Connection, ts: i64) -> Result<()> {
     cloud_state_set_i64(db, "last_cleanup_at", ts)
+}
+
+pub fn get_last_pull_at(db: &Connection) -> Result<i64> {
+    cloud_state_get_i64(db, "last_pull_at")
+}
+
+pub fn set_last_pull_at(db: &Connection, ts: i64) -> Result<()> {
+    cloud_state_set_i64(db, "last_pull_at", ts)
+}
+
+/// Every device id this machine has ever synced under, current one included.
+/// The pull filter excludes ALL of them — if the user renames `device_id` in
+/// xclaude-cloud.json, rows previously pushed under the old id must not be
+/// pulled back into cloud_cache and double-counted against local token_usage.
+pub fn known_device_ids(db: &Connection, current: &str) -> Result<Vec<String>> {
+    let stored: Option<String> = db
+        .query_row(
+            "SELECT value FROM cloud_state WHERE key = 'known_device_ids'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let mut ids: Vec<String> = stored
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    if !ids.iter().any(|i| i == current) {
+        ids.push(current.to_string());
+        db.execute(
+            "INSERT INTO cloud_state (key, value) VALUES ('known_device_ids', ?1) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![serde_json::to_string(&ids)?],
+        )?;
+    }
+    Ok(ids)
 }

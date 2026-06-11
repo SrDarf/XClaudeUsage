@@ -14,6 +14,9 @@ use crate::paths;
 
 const BASE_EVENTS: &[&str] = &["Stop", "SubagentStop"];
 const CLOUD_EVENTS: &[&str] = &["Stop", "SubagentStop", "SubagentStart", "PostToolUse"];
+/// CLOUD_EVENTS minus BASE_EVENTS: hooks that only exist to feed cloud sync
+/// and must be removed when a re-install disables it.
+const CLOUD_ONLY_EVENTS: &[&str] = &["SubagentStart", "PostToolUse"];
 
 #[derive(Debug)]
 struct CloudAnswer {
@@ -57,6 +60,31 @@ pub fn run() -> Result<()> {
     let status_action = settings::upsert_status_line(&mut settings, &statusline_cmd);
     let hook_actions = settings::upsert_hooks(&mut settings, events, &record_cmd);
 
+    // Answering "no" must actually turn cloud sync OFF for an install that
+    // previously enabled it: drop the cloud-only hooks (they'd keep firing a
+    // network sync on every tool call) and park the credentials file — the
+    // recorder gates syncing solely on that file's existence.
+    let mut cloud_disable_notes: Vec<String> = Vec::new();
+    if !cloud.enabled {
+        let removed = settings::remove_hooks_for_events(&mut settings, CLOUD_ONLY_EVENTS);
+        if removed > 0 {
+            cloud_disable_notes.push(format!(
+                "removed {removed} cloud-only hook entr{} from a previous cloud-enabled install",
+                if removed == 1 { "y" } else { "ies" }
+            ));
+        }
+        let cloud_cfg = paths::cloud_config_path()?;
+        if cloud_cfg.exists() {
+            let disabled = cloud_cfg.with_extension("json.disabled");
+            fs::rename(&cloud_cfg, &disabled)
+                .with_context(|| format!("disabling {}", cloud_cfg.display()))?;
+            cloud_disable_notes.push(format!(
+                "kept credentials in {} — re-run install and answer 'y' to re-enable",
+                disabled.display()
+            ));
+        }
+    }
+
     let cloud_result = if cloud.enabled {
         Some(write_cloud_config(&cloud)?)
     } else {
@@ -84,6 +112,9 @@ pub fn run() -> Result<()> {
         "  cloud sync: {}",
         if cloud.enabled { "enabled" } else { "disabled" }
     ))?;
+    for note in &cloud_disable_notes {
+        tty.writeln(&format!("    {note}"))?;
+    }
     if let Some(action) = cloud_result {
         tty.writeln(&format!(
             "  cloud config: {}",
@@ -185,9 +216,15 @@ pub fn uninstall() -> Result<()> {
 }
 
 fn prompt_cloud(tty: &mut prompt::Tty) -> Result<CloudAnswer> {
+    // Also look at the `.disabled` file a previous "no to cloud" re-install
+    // parked, so re-enabling can offer the saved credentials back.
     let existing = paths::cloud_config_path()
         .ok()
-        .and_then(|p| fs::read_to_string(&p).ok())
+        .and_then(|p| {
+            fs::read_to_string(&p)
+                .ok()
+                .or_else(|| fs::read_to_string(p.with_extension("json.disabled")).ok())
+        })
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
 
     let prompt_msg = "Enable Turso cloud sync for multi-device aggregation? [y/N]: ";

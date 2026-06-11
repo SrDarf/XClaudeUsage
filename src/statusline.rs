@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -9,8 +10,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::db;
 use crate::paths;
+use crate::stdin;
 use crate::time::unix_now;
 use crate::transcript;
+
+/// Matches the legacy JS self-timeout: statusLine commands have no
+/// harness-side timeout, so a pipe that never closes must not hang us.
+const STDIN_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Deserialize, Default)]
 struct Payload {
@@ -63,8 +69,9 @@ struct Totals {
 }
 
 pub fn run() -> Result<()> {
-    let mut input = String::new();
-    io::stdin().read_to_string(&mut input).ok();
+    let Some(input) = stdin::read_to_string_timeout(STDIN_TIMEOUT) else {
+        return Ok(());
+    };
     let payload: Payload = serde_json::from_str(&input).unwrap_or_default();
 
     let model = payload
@@ -95,7 +102,13 @@ pub fn run() -> Result<()> {
     };
     if let Some(conn) = conn.as_ref() {
         let _ = write_window(conn, five_hour, "five_hour_window", "start_at", 5 * 3600);
-        let _ = write_window(conn, seven_day, "seven_day_window", "starts_at", 7 * 24 * 3600);
+        let _ = write_window(
+            conn,
+            seven_day,
+            "seven_day_window",
+            "starts_at",
+            7 * 24 * 3600,
+        );
     }
 
     let tokens = conn
@@ -286,7 +299,9 @@ struct LegacyCache {
 
 fn read_session_tokens(transcript_path: Option<&str>, session: &str) -> Option<Totals> {
     let transcript_path = transcript_path?;
-    if session.contains('/') || session.contains('\\') || session.contains("..") {
+    // Non-empty + no traversal: an empty session would collapse every session
+    // onto one shared claude-tokens-.json cache, mixing their totals.
+    if !paths::is_safe_session_id(session) {
         return None;
     }
     let mut paths_vec: Vec<PathBuf> = Vec::new();
@@ -294,23 +309,9 @@ fn read_session_tokens(transcript_path: Option<&str>, session: &str) -> Option<T
     if main.exists() {
         paths_vec.push(main.to_path_buf());
     }
-    let subagent_dir: PathBuf = {
-        // strip_suffix mirrors the JS regex /\.jsonl$/ (at-end, once).
-        let s = transcript_path
-            .strip_suffix(".jsonl")
-            .unwrap_or(transcript_path);
-        PathBuf::from(format!("{s}/subagents"))
-    };
-    if subagent_dir.exists() {
-        if let Ok(rd) = fs::read_dir(&subagent_dir) {
-            for entry in rd.flatten() {
-                let p = entry.path();
-                if p.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-                    paths_vec.push(p);
-                }
-            }
-        }
-    }
+    // Same discovery walk as the recorder, so the fallback and the DB path can
+    // never disagree about which subagent/workflow files count.
+    paths_vec.extend(transcript::subagent_transcripts(main));
     if paths_vec.is_empty() {
         return None;
     }
@@ -342,38 +343,27 @@ fn read_session_tokens(transcript_path: Option<&str>, session: &str) -> Option<T
 }
 
 fn consume_transcript(path: &Path, entry: &mut LegacyEntry) {
-    let Ok(meta) = fs::metadata(path) else { return };
-    let size = meta.len();
-    if entry.offset > size {
-        *entry = LegacyEntry::default();
+    // A shrunken file means the transcript was recreated: read_new would
+    // silently restart from 0, so the accumulated counters must reset too or
+    // the re-read would double-count.
+    if let Ok(meta) = fs::metadata(path) {
+        if entry.offset > meta.len() {
+            *entry = LegacyEntry::default();
+        }
     }
-    if entry.offset == size {
-        return;
-    }
-    let Ok(mut f) = fs::File::open(path) else {
+    // Delegate the incremental read to the shared reader — it finds the last
+    // newline at the byte level, so invalid UTF-8 can't skew the saved offset
+    // (each lossy U+FFFD replacement is 3 bytes, not 1).
+    let Ok(Some(read)) = transcript::read_new(path, entry.offset) else {
         return;
     };
-    use std::io::Seek;
-    if f.seek(io::SeekFrom::Start(entry.offset)).is_err() {
-        return;
-    }
-    let mut buf = Vec::with_capacity((size - entry.offset) as usize);
-    if f.take(size - entry.offset).read_to_end(&mut buf).is_err() {
-        return;
-    }
-    let text = String::from_utf8_lossy(&buf);
-    let Some(last_nl) = text.rfind('\n') else {
-        return;
-    };
-    let process = &text[..last_nl];
-    let consumed = (last_nl as u64) + 1;
-    for ev in transcript::parse_assistant_events(process, None) {
+    for ev in transcript::parse_assistant_events(&read.text, None) {
         entry.input += ev.usage.input;
         entry.output += ev.usage.output;
         entry.cache_creation += ev.usage.cache_creation;
         entry.cache_read += ev.usage.cache_read;
     }
-    entry.offset += consumed;
+    entry.offset = read.new_offset;
 }
 
 // ---------------------------------------------------------------------------

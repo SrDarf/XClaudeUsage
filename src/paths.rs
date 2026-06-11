@@ -40,3 +40,25 @@ pub fn ensure_data_dir() -> Result<()> {
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     Ok(())
 }
+
+/// A session id is interpolated into file names and DB rows: it must be
+/// non-empty (an empty id would collapse every session onto one shared cache
+/// file) and free of path separators / parent-dir traversal. Single guard
+/// shared by the recorder and the statusline so the rule can't drift.
+pub fn is_safe_session_id(s: &str) -> bool {
+    !s.is_empty() && !s.contains('/') && !s.contains('\\') && !s.contains("..")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_id_guard_rejects_empty_and_traversal() {
+        assert!(is_safe_session_id("11111111-2222-3333-4444-555555555555"));
+        assert!(!is_safe_session_id(""));
+        assert!(!is_safe_session_id("../../etc"));
+        assert!(!is_safe_session_id("a/b"));
+        assert!(!is_safe_session_id("a\\b"));
+    }
+}

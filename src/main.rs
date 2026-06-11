@@ -6,6 +6,7 @@ mod log;
 mod paths;
 mod record;
 mod statusline;
+mod stdin;
 mod time;
 mod transcript;
 

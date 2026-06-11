@@ -1,15 +1,21 @@
-use std::io::{self, Read};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::cloud;
 use crate::db;
+use crate::paths;
+use crate::stdin;
 use crate::time::unix_now;
 use crate::transcript;
+
+/// Matches the legacy JS self-timeout: give up if stdin never reaches EOF so a
+/// wedged pipe can't leave hook processes hanging around forever.
+const STDIN_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Per-hook capabilities. Source of truth — matches xclaude-record.js:HOOK_BEHAVIOR.
 #[derive(Debug, Clone, Copy)]
@@ -74,8 +80,9 @@ struct ModelInfo {
 }
 
 pub fn run() -> Result<()> {
-    let mut input = String::new();
-    io::stdin().read_to_string(&mut input).ok();
+    let Some(input) = stdin::read_to_string_timeout(STDIN_TIMEOUT) else {
+        return Ok(());
+    };
     if input.trim().is_empty() {
         return Ok(());
     }
@@ -87,11 +94,7 @@ pub fn run() -> Result<()> {
 fn record(payload: HookPayload) -> Result<()> {
     let session_id = payload.session_id.unwrap_or_default();
     let transcript_path = payload.transcript_path.unwrap_or_default();
-    if session_id.is_empty() || transcript_path.is_empty() {
-        return Ok(());
-    }
-    // Defensive: refuse path traversal in session_id (matches JS guard).
-    if session_id.contains('/') || session_id.contains('\\') || session_id.contains("..") {
+    if !paths::is_safe_session_id(&session_id) || transcript_path.is_empty() {
         return Ok(());
     }
 
@@ -146,15 +149,30 @@ fn record(payload: HookPayload) -> Result<()> {
         enqueue_outbox(&mut db, &cloud_device_id, behavior.event_type, now)?;
     }
 
-    if let Err(e) = cloud::sync::sync(
+    // PostToolUse fires on every tool call; without a gate each one would pay
+    // a blocking network roundtrip. Pull at most once per PULL_INTERVAL_SECONDS
+    // (pushes are not throttled — the outbox must drain promptly).
+    let pull =
+        behavior.pull && (now - cloud::get_last_pull_at(&db)?) >= cloud::PULL_INTERVAL_SECONDS;
+
+    if !behavior.push && !pull {
+        return Ok(());
+    }
+
+    match cloud::sync::sync(
         &config,
         &db,
         &cloud_device_id,
         behavior.push,
-        behavior.pull,
+        pull,
         cleanup_due,
     ) {
-        crate::log::warn(&format!("cloud sync failed: {e:#}"));
+        Ok(()) => {
+            if pull {
+                cloud::set_last_pull_at(&db, now)?;
+            }
+        }
+        Err(e) => crate::log::warn(&format!("cloud sync failed: {e:#}")),
     }
     Ok(())
 }
@@ -167,7 +185,10 @@ fn write_local(
     local_device_label: &str,
     now: i64,
 ) -> Result<()> {
-    let tx = db.transaction()?;
+    // BEGIN IMMEDIATE (as the JS did): take the write lock up front so a
+    // concurrent hook blocks on busy_timeout instead of failing with
+    // SQLITE_BUSY_SNAPSHOT when this deferred-read tx upgrades to a write.
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
     // Main session transcript.
     ingest_transcript(
@@ -186,7 +207,7 @@ fn write_local(
     // the hook never hands us their paths, so we discover and ingest them here.
     // Each file is tracked by its own `transcript_progress` offset and deduped
     // by `message_uuid`, exactly like the main transcript.
-    for sub in subagent_transcripts(transcript_path) {
+    for sub in transcript::subagent_transcripts(transcript_path) {
         ingest_transcript(
             &tx,
             session_id,
@@ -271,48 +292,9 @@ fn ingest_transcript(
     Ok(())
 }
 
-/// Discover the subagent/workflow transcripts that belong to a main session
-/// transcript. For `.../projects/<proj>/<session>.jsonl` they live under
-/// `.../projects/<proj>/<session>/subagents/` — plain Task subagents directly
-/// inside it, and deep-research / ultracode dynamic workflows nested under
-/// `subagents/workflows/wf_*/` — all named `agent-*.jsonl`. Returns an empty
-/// vec when the directory is absent (the common case for a session that never
-/// spawned a subagent).
-fn subagent_transcripts(main: &Path) -> Vec<PathBuf> {
-    // `<...>/<session>.jsonl` -> `<...>/<session>` -> `<...>/<session>/subagents`
-    let root = main.with_extension("").join("subagents");
-    let mut out = Vec::new();
-    collect_agent_files(&root, &mut out, 0);
-    out
-}
-
-fn collect_agent_files(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
-    // The real tree is at most `subagents/workflows/wf_*/agent-*.jsonl`; bound
-    // recursion so a pathological symlink loop can't wedge the hook.
-    if depth > 4 {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let Ok(ft) = entry.file_type() else { continue };
-        let path = entry.path();
-        if ft.is_dir() {
-            collect_agent_files(&path, out, depth + 1);
-        } else if ft.is_file() {
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with("agent-") && name.ends_with(".jsonl") {
-                    out.push(path);
-                }
-            }
-        }
-    }
-}
-
 fn run_retention_cleanup(db: &mut Connection, now: i64) -> Result<()> {
     let cutoff = now - cloud::RETENTION_SECONDS;
-    let tx = db.transaction()?;
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute(
         "DELETE FROM token_usage WHERE executed_at < ?1",
         params![cutoff],
@@ -339,10 +321,14 @@ fn enqueue_outbox(
     let Some(event_type) = event_type else {
         return Ok(());
     };
-    let last_pushed = cloud::get_or_init_push_cursor(db)?;
     let window_start = now - cloud::RETENTION_SECONDS;
 
-    let tx = db.transaction()?;
+    // The cursor read MUST happen inside the IMMEDIATE transaction (as the JS
+    // bracketed it): two concurrent hooks reading the same cursor would both
+    // enqueue the same rows under fresh event UUIDs and the cloud would count
+    // them twice.
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let last_pushed = cloud::get_or_init_push_cursor(&tx)?;
     let groups: Vec<(String, i64, i64, i64, i64, i64)> = {
         let mut stmt = tx.prepare(
             "SELECT \
@@ -409,32 +395,45 @@ fn enqueue_outbox(
 }
 
 fn hostname() -> String {
-    // Avoid an extra crate for this — just call the system. Best-effort; empty
+    // Avoid an extra crate for this. The kernel file is the reliable cheap
+    // source on Linux; HOSTNAME is a shell-local var that is rarely exported
+    // to hook processes (and can name the wrong host inside containers), so it
+    // and the fork+exec of `hostname` are fallbacks only. Best-effort; empty
     // string on failure matches the JS `os.hostname() || ''`.
-    std::env::var("HOSTNAME")
-        .ok()
-        .or_else(|| {
-            #[cfg(unix)]
-            {
-                use std::process::Command;
-                Command::new("hostname")
-                    .output()
-                    .ok()
-                    .and_then(|o| String::from_utf8(o.stdout).ok())
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
+    #[cfg(target_os = "linux")]
+    if let Ok(s) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
+        let s = s.trim();
+        if !s.is_empty() {
+            return s.to_string();
+        }
+    }
+    for var in ["HOSTNAME", "COMPUTERNAME"] {
+        if let Ok(s) = std::env::var(var) {
+            if !s.is_empty() {
+                return s;
             }
-            #[cfg(not(unix))]
-            {
-                std::env::var("COMPUTERNAME").ok()
-            }
-        })
-        .unwrap_or_default()
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::process::Command;
+        if let Some(s) = Command::new("hostname")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            return s;
+        }
+    }
+    String::new()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     const EV1: &str = r#"{"type":"assistant","uuid":"uuid-1","message":{"model":"claude-x","usage":{"input_tokens":10,"output_tokens":20,"cache_creation_input_tokens":5,"cache_read_input_tokens":3}}}"#;
@@ -574,47 +573,5 @@ mod tests {
             "duplicate uuid not double-counted"
         );
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn discovers_plain_and_workflow_subagent_transcripts() {
-        // Mirror the on-disk layout:
-        //   <proj>/<session>.jsonl                                   (main)
-        //   <proj>/<session>/subagents/agent-aaa.jsonl              (Task subagent)
-        //   <proj>/<session>/subagents/workflows/wf_x/agent-bbb.jsonl (workflow)
-        let proj = unique_tmp("layout");
-        let session = "11111111-2222-3333-4444-555555555555";
-        let main = proj.join(format!("{session}.jsonl"));
-        std::fs::write(&main, "{}\n").unwrap();
-
-        let sub = proj.join(session).join("subagents");
-        std::fs::create_dir_all(&sub).unwrap();
-        std::fs::write(sub.join("agent-aaa.jsonl"), "{}\n").unwrap();
-
-        let wf = sub.join("workflows").join("wf_deadbeef");
-        std::fs::create_dir_all(&wf).unwrap();
-        std::fs::write(wf.join("agent-bbb.jsonl"), "{}\n").unwrap();
-
-        // Decoys that must NOT be picked up.
-        std::fs::write(sub.join("scratch.jsonl"), "{}\n").unwrap();
-        std::fs::write(sub.join("agent-notes.txt"), "x").unwrap();
-
-        let mut found: Vec<String> = subagent_transcripts(&main)
-            .into_iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
-        found.sort();
-
-        assert_eq!(found, vec!["agent-aaa.jsonl", "agent-bbb.jsonl"]);
-        std::fs::remove_dir_all(&proj).ok();
-    }
-
-    #[test]
-    fn subagents_dir_absent_yields_empty() {
-        let proj = unique_tmp("empty");
-        let main = proj.join("66666666-7777-8888-9999-000000000000.jsonl");
-        std::fs::write(&main, "{}\n").unwrap();
-        assert!(subagent_transcripts(&main).is_empty());
-        std::fs::remove_dir_all(&proj).ok();
     }
 }

@@ -34,11 +34,20 @@ pub fn sync(
 
     let mut statements: Vec<Statement> = Vec::new();
 
-    // 1. INSERT every outbox row as a token_delta.
+    // 1. INSERT every outbox row as a token_delta. A row whose payload doesn't
+    // parse can never be sent — drop it deliberately (with a trace) instead of
+    // letting it sit in the outbox and fail every future sync.
+    let mut sent: Vec<&str> = Vec::new();
+    let mut poison: Vec<&str> = Vec::new();
     for (event_id, payload) in &outbox_rows {
         let Ok(p) = serde_json::from_str::<Value>(payload) else {
+            crate::log::warn(&format!(
+                "cloud outbox: dropping unparseable payload for event {event_id}"
+            ));
+            poison.push(event_id.as_str());
             continue;
         };
+        sent.push(event_id.as_str());
         statements.push(Statement {
             sql: "INSERT OR IGNORE INTO token_delta \
                   (device_id, model, event_type, input, output, cache_creation, cache_read, executed_at, event_id) \
@@ -58,21 +67,26 @@ pub fn sync(
         });
     }
 
-    // 2. SELECT new deltas from other devices.
+    // 2. SELECT new deltas from other devices. Exclude every device id this
+    // machine has EVER synced under, not just the current one — after a
+    // device_id rename in xclaude-cloud.json, rows pushed under the old id
+    // must not be pulled back and double-counted against local token_usage.
     let pull_index: Option<usize> = if do_pull {
+        let known_ids = super::known_device_ids(db, device_id)?;
+        let placeholders = vec!["?"; known_ids.len()].join(", ");
         let idx = statements.len();
+        let mut args = vec![json!(last_remote_id)];
+        args.extend(known_ids.into_iter().map(Value::String));
+        args.push(json!(now - RETENTION_SECONDS));
+        args.push(json!(PULL_LIMIT));
         statements.push(Statement {
-            sql: "SELECT id, device_id, model, input, output, cache_creation, cache_read, executed_at \
-                  FROM token_delta \
-                  WHERE id > ? AND device_id != ? AND executed_at >= ? \
-                  ORDER BY id ASC LIMIT ?"
-                .to_string(),
-            args: vec![
-                json!(last_remote_id),
-                Value::String(device_id.to_string()),
-                json!(now - RETENTION_SECONDS),
-                json!(PULL_LIMIT),
-            ],
+            sql: format!(
+                "SELECT id, device_id, model, input, output, cache_creation, cache_read, executed_at \
+                 FROM token_delta \
+                 WHERE id > ? AND device_id NOT IN ({placeholders}) AND executed_at >= ? \
+                 ORDER BY id ASC LIMIT ?"
+            ),
+            args,
         });
         Some(idx)
     } else {
@@ -85,6 +99,15 @@ pub fn sync(
             sql: "DELETE FROM token_delta WHERE executed_at < ?".to_string(),
             args: vec![json!(now - RETENTION_SECONDS)],
         });
+    }
+
+    // Purge poison rows right away — they don't depend on the network call and
+    // an early return below must not leave them to warn again on every sync.
+    if !poison.is_empty() {
+        let mut del = db.prepare("DELETE FROM cloud_outbox WHERE event_id = ?")?;
+        for event_id in &poison {
+            del.execute(params![event_id])?;
+        }
     }
 
     if statements.is_empty() {
@@ -101,9 +124,12 @@ pub fn sync(
     // 4. Commit local-side bookkeeping in a single transaction.
     db.execute_batch("BEGIN IMMEDIATE")?;
     let result: Result<()> = (|| {
-        if !outbox_rows.is_empty() {
+        // Only the rows whose INSERTs were actually executed remotely —
+        // pipeline::execute errors when the server returns fewer results than
+        // statements, so reaching this point means every one of them ran.
+        if !sent.is_empty() {
             let mut del = db.prepare("DELETE FROM cloud_outbox WHERE event_id = ?")?;
-            for (event_id, _) in &outbox_rows {
+            for event_id in &sent {
                 del.execute(params![event_id])?;
             }
         }

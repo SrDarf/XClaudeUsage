@@ -94,9 +94,19 @@ info "extracting"
 [ -f "$TMP/xclaudeusage" ] || fail "archive did not contain a 'xclaudeusage' binary"
 
 mkdir -p "$BIN_DIR"
-mv "$TMP/xclaudeusage" "$BIN_PATH"
-chmod +x "$BIN_PATH"
+# Stage next to the destination and rename: $TMP is usually tmpfs, and a
+# cross-filesystem mv over a live executable degrades to truncate+copy — a
+# running Claude Code session could exec a half-written binary. A same-dir
+# rename is atomic.
+STAGED="$BIN_PATH.download-$$"
+cp "$TMP/xclaudeusage" "$STAGED"
+chmod +x "$STAGED"
+mv -f "$STAGED" "$BIN_PATH"
 info "installed $BIN_PATH"
+
+# exec replaces this shell, so the EXIT trap won't fire — clean up first.
+rm -rf "$TMP"
+trap - EXIT INT TERM
 
 # Hand off to the binary itself for interactive configuration.
 exec "$BIN_PATH" install

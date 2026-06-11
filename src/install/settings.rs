@@ -2,10 +2,12 @@
 //
 // Hard rules (must not regress; carried over from the JS installer):
 //   1. Refuse to overwrite a non-XClaude `statusLine`.
-//   2. Identify our own entries by substring on `command`. Recognize BOTH the
-//      legacy JS path (`xclaude-usage.js`/`xclaude-record.js`) AND the new
-//      Rust invocation (`xclaudeusage statusline`/`xclaudeusage record`), so
-//      re-runs upgrade in place instead of duplicating.
+//   2. Identify our own entries by the command's PROGRAM token. Recognize BOTH
+//      the legacy JS path (`xclaude-usage.js`/`xclaude-record.js`) AND the new
+//      Rust invocation (`xclaudeusage statusline`/`xclaudeusage record`,
+//      quoted or not, with or without `.exe`), so re-runs upgrade in place
+//      instead of duplicating. A foreign command that merely *embeds* those
+//      words (e.g. a wrapper) must NOT match.
 //   3. Preserve every hook entry that isn't ours.
 //   4. Write a timestamped backup only when content actually changes.
 
@@ -93,26 +95,45 @@ pub fn classify_status_line(settings: &Value) -> StatusLineState {
 }
 
 pub fn is_ours_statusline(cmd: &str) -> bool {
-    if cmd.contains("xclaude-usage.js") {
-        return true;
-    }
-    // The installer writes commands like `"/path/to/xclaudeusage" statusline`,
-    // so a literal `"` sits between the path and the subcommand. Strip quotes
-    // before substring matching so single/double quoted paths both register.
-    let normalized = strip_shell_quotes(cmd);
-    normalized.contains("xclaudeusage statusline")
+    cmd.contains("xclaude-usage.js") || is_ours(cmd, "statusline")
 }
 
 pub fn is_ours_record(cmd: &str) -> bool {
-    if cmd.contains("xclaude-record.js") {
-        return true;
-    }
-    let normalized = strip_shell_quotes(cmd);
-    normalized.contains("xclaudeusage record")
+    cmd.contains("xclaude-record.js") || is_ours(cmd, "record")
 }
 
-fn strip_shell_quotes(s: &str) -> String {
-    s.chars().filter(|c| *c != '"' && *c != '\'').collect()
+/// True only when the command's PROGRAM is our binary and its first argument
+/// is `subcommand`. The installer writes `"/path/to/xclaudeusage" statusline`
+/// (on Windows `"C:\...\xclaudeusage.exe" statusline`), so the program token
+/// must be resolved through quotes and the `.exe` suffix. Matching the
+/// program position — not a substring anywhere in the command — keeps a
+/// foreign wrapper that merely embeds the words (e.g.
+/// `wrapper --inner 'xclaudeusage statusline'`) from being claimed as ours
+/// and overwritten or uninstalled.
+fn is_ours(cmd: &str, subcommand: &str) -> bool {
+    let (program, rest) = split_program(cmd);
+    // Basename on both separators by hand: Path::file_name only understands
+    // the HOST's separator, but a Windows path must classify identically when
+    // this code runs anywhere (e.g. tests, dotfiles synced across machines).
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    (name == "xclaudeusage" || name == "xclaudeusage.exe")
+        && rest.split_whitespace().next() == Some(subcommand)
+}
+
+/// Split a command line into (program, rest). A leading single or double
+/// quote delimits the program (paths with spaces); otherwise the program runs
+/// to the first whitespace.
+fn split_program(cmd: &str) -> (&str, &str) {
+    let cmd = cmd.trim_start();
+    if let Some(quote) = cmd.chars().next().filter(|c| *c == '"' || *c == '\'') {
+        if let Some(end) = cmd[1..].find(quote) {
+            return (&cmd[1..1 + end], &cmd[1 + end + 1..]);
+        }
+    }
+    match cmd.split_once(char::is_whitespace) {
+        Some((program, rest)) => (program, rest),
+        None => (cmd, ""),
+    }
 }
 
 /// Set the `statusLine` entry, preserving any extra fields on the existing
@@ -216,6 +237,44 @@ pub fn upsert_hooks(
     summary
 }
 
+/// Remove our record-hook entries for the given events only, preserving
+/// foreign entries. Used when a re-install disables cloud sync: the
+/// cloud-only events (SubagentStart/PostToolUse) must not keep firing.
+/// Returns the number of entries removed.
+pub fn remove_hooks_for_events(settings: &mut Value, events: &[&str]) -> usize {
+    let mut removed = 0;
+    let Some(hooks) = settings.get_mut("hooks").and_then(Value::as_object_mut) else {
+        return 0;
+    };
+    for event in events {
+        let Some(arr) = hooks.get_mut(*event).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        arr.retain_mut(|group| {
+            let Some(group_hooks) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+                return true;
+            };
+            group_hooks.retain(|entry| {
+                let cmd = entry
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if is_ours_record(cmd) {
+                    removed += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+            !group_hooks.is_empty()
+        });
+        if arr.is_empty() {
+            hooks.remove(*event);
+        }
+    }
+    removed
+}
+
 /// Remove every XClaude entry from the settings tree. Used by `uninstall`.
 /// Returns the number of entries removed (statusLine + hook entries).
 pub fn remove_all_xclaude(settings: &mut Value) -> usize {
@@ -300,6 +359,56 @@ mod tests {
         assert!(!is_ours_statusline("starship prompt"));
         assert!(!is_ours_record("some-other-tool record"));
         assert!(!is_ours_statusline(""));
+    }
+
+    // Regression: the Windows installer writes `"C:\...\xclaudeusage.exe"
+    // statusline` — the `.exe` sits between the binary name and subcommand,
+    // which the old substring match never recognized (re-installs aborted as
+    // "Foreign" and uninstall removed nothing).
+    #[test]
+    fn detects_windows_exe_paths() {
+        assert!(is_ours_statusline(
+            r#""C:\Users\u\.claude\bin\xclaudeusage.exe" statusline"#
+        ));
+        assert!(is_ours_record(
+            r#""C:\Users\u\.claude\bin\xclaudeusage.exe" record"#
+        ));
+    }
+
+    // Regression: the old quote-strip + substring match claimed any FOREIGN
+    // command that merely embedded the words, letting install overwrite a
+    // user's wrapper statusLine and uninstall delete a foreign hook.
+    #[test]
+    fn rejects_foreign_wrappers_embedding_our_words() {
+        assert!(!is_ours_statusline(
+            "wrapper --inner 'xclaudeusage statusline' --legacy"
+        ));
+        assert!(!is_ours_record(
+            r#"mytool --label "run xclaudeusage" "record mode""#
+        ));
+    }
+
+    #[test]
+    fn remove_hooks_for_events_targets_only_named_events() {
+        let cmd = r#""/home/luka/.claude/bin/xclaudeusage" record"#;
+        let mut settings = json!({
+            "hooks": {
+                "Stop": [
+                    { "hooks": [{ "type": "command", "command": cmd, "timeout": 10 }] },
+                ],
+                "PostToolUse": [
+                    { "hooks": [{ "type": "command", "command": cmd, "timeout": 10 }] },
+                    { "hooks": [{ "type": "command", "command": "other-tool log", "timeout": 5 }] },
+                ],
+            }
+        });
+        let removed = remove_hooks_for_events(&mut settings, &["PostToolUse", "SubagentStart"]);
+        assert_eq!(removed, 1);
+        // Stop untouched; PostToolUse keeps only the foreign entry.
+        assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 1);
+        let ptu = settings["hooks"]["PostToolUse"].as_array().unwrap();
+        assert_eq!(ptu.len(), 1);
+        assert_eq!(ptu[0]["hooks"][0]["command"], "other-tool log");
     }
 
     #[test]

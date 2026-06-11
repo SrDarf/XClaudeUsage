@@ -21,7 +21,9 @@ function Fail($msg) { Write-Error "[install] $msg"; exit 1 }
 $arch = (Get-CimInstance Win32_Processor).Architecture
 switch ($arch) {
   9  { $archPart = 'x86_64'  }
-  12 { $archPart = 'aarch64' }
+  # 12 = ARM64: no aarch64-pc-windows-msvc artifact is published (release.yml
+  # only builds x86_64 for Windows), so the download would 404. Point at cargo.
+  12 { Fail "Windows on ARM is not pre-built. Install with: cargo install xclaudeusage --locked" }
   default { Fail "unsupported architecture: $arch" }
 }
 

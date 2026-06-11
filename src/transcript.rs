@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde::Deserialize;
@@ -46,16 +46,19 @@ struct RawMessage {
     usage: Option<RawUsage>,
 }
 
+// `Option<i64>` (not plain i64 with serde(default)) so an explicit JSON
+// `null` in one field doesn't fail the whole line and drop its valid tokens —
+// the legacy JS tolerated null via `|| 0`.
 #[derive(Deserialize, Default)]
 struct RawUsage {
     #[serde(default)]
-    input_tokens: i64,
+    input_tokens: Option<i64>,
     #[serde(default)]
-    output_tokens: i64,
+    output_tokens: Option<i64>,
     #[serde(default)]
-    cache_creation_input_tokens: i64,
+    cache_creation_input_tokens: Option<i64>,
     #[serde(default)]
-    cache_read_input_tokens: i64,
+    cache_read_input_tokens: Option<i64>,
 }
 
 /// Read the JSONL transcript from `offset` to EOF, returning all complete lines.
@@ -98,6 +101,46 @@ pub fn read_new(path: &Path, offset: u64) -> Result<Option<ReadResult>> {
     }))
 }
 
+/// Discover the subagent/workflow transcripts that belong to a main session
+/// transcript. For `.../projects/<proj>/<session>.jsonl` they live under
+/// `.../projects/<proj>/<session>/subagents/` — plain Task subagents directly
+/// inside it, and deep-research / ultracode dynamic workflows nested under
+/// `subagents/workflows/wf_*/` — all named `agent-*.jsonl`. Returns an empty
+/// vec when the directory is absent (the common case for a session that never
+/// spawned a subagent). Shared by the recorder and the statusline fallback so
+/// the two paths can never disagree about which files count.
+pub fn subagent_transcripts(main: &Path) -> Vec<PathBuf> {
+    // `<...>/<session>.jsonl` -> `<...>/<session>` -> `<...>/<session>/subagents`
+    let root = main.with_extension("").join("subagents");
+    let mut out = Vec::new();
+    collect_agent_files(&root, &mut out, 0);
+    out
+}
+
+fn collect_agent_files(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
+    // The real tree is at most `subagents/workflows/wf_*/agent-*.jsonl`; bound
+    // recursion so a pathological symlink loop can't wedge the hook.
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        let path = entry.path();
+        if ft.is_dir() {
+            collect_agent_files(&path, out, depth + 1);
+        } else if ft.is_file() {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with("agent-") && name.ends_with(".jsonl") {
+                    out.push(path);
+                }
+            }
+        }
+    }
+}
+
 pub fn parse_assistant_events(text: &str, fallback_model: Option<&str>) -> Vec<AssistantEvent> {
     let mut out = Vec::new();
     for line in text.split('\n') {
@@ -125,10 +168,10 @@ pub fn parse_assistant_events(text: &str, fallback_model: Option<&str>) -> Vec<A
             model,
             uuid,
             usage: Usage {
-                input: usage.input_tokens,
-                output: usage.output_tokens,
-                cache_creation: usage.cache_creation_input_tokens,
-                cache_read: usage.cache_read_input_tokens,
+                input: usage.input_tokens.unwrap_or(0),
+                output: usage.output_tokens.unwrap_or(0),
+                cache_creation: usage.cache_creation_input_tokens.unwrap_or(0),
+                cache_read: usage.cache_read_input_tokens.unwrap_or(0),
             },
         });
     }
@@ -262,5 +305,61 @@ mod tests {
         let p = std::env::temp_dir().join("xcu-transcript-absent-zzz.jsonl");
         std::fs::remove_file(&p).ok();
         assert!(read_new(&p, 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn null_usage_field_counts_remaining_tokens() {
+        // serde(default) alone rejects explicit nulls; the whole line (and its
+        // valid tokens) used to be dropped. Option<i64> must tolerate it.
+        let line = r#"{"type":"assistant","uuid":"u-n","message":{"model":"m","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":null}}}"#;
+        let events = parse_assistant_events(line, None);
+        assert_eq!(events.len(), 1, "null field must not drop the event");
+        assert_eq!(events[0].usage.input, 100);
+        assert_eq!(events[0].usage.output, 50);
+        assert_eq!(events[0].usage.cache_read, 0);
+    }
+
+    #[test]
+    fn discovers_plain_and_workflow_subagent_transcripts() {
+        // Mirror the on-disk layout:
+        //   <proj>/<session>.jsonl                                   (main)
+        //   <proj>/<session>/subagents/agent-aaa.jsonl              (Task subagent)
+        //   <proj>/<session>/subagents/workflows/wf_x/agent-bbb.jsonl (workflow)
+        let proj = std::env::temp_dir().join(format!("xcu-layout-{}", std::process::id()));
+        std::fs::create_dir_all(&proj).unwrap();
+        let session = "11111111-2222-3333-4444-555555555555";
+        let main = proj.join(format!("{session}.jsonl"));
+        std::fs::write(&main, "{}\n").unwrap();
+
+        let sub = proj.join(session).join("subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("agent-aaa.jsonl"), "{}\n").unwrap();
+
+        let wf = sub.join("workflows").join("wf_deadbeef");
+        std::fs::create_dir_all(&wf).unwrap();
+        std::fs::write(wf.join("agent-bbb.jsonl"), "{}\n").unwrap();
+
+        // Decoys that must NOT be picked up.
+        std::fs::write(sub.join("scratch.jsonl"), "{}\n").unwrap();
+        std::fs::write(sub.join("agent-notes.txt"), "x").unwrap();
+
+        let mut found: Vec<String> = subagent_transcripts(&main)
+            .into_iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        found.sort();
+
+        assert_eq!(found, vec!["agent-aaa.jsonl", "agent-bbb.jsonl"]);
+        std::fs::remove_dir_all(&proj).ok();
+    }
+
+    #[test]
+    fn subagents_dir_absent_yields_empty() {
+        let proj = std::env::temp_dir().join(format!("xcu-nosubs-{}", std::process::id()));
+        std::fs::create_dir_all(&proj).unwrap();
+        let main = proj.join("66666666-7777-8888-9999-000000000000.jsonl");
+        std::fs::write(&main, "{}\n").unwrap();
+        assert!(subagent_transcripts(&main).is_empty());
+        std::fs::remove_dir_all(&proj).ok();
     }
 }
