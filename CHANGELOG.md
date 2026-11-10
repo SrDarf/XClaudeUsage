@@ -9,6 +9,8 @@ branch. The original Node.js implementation lives on `main`.
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-11-10
+
 ### Added
 - **Plans without a 5-hour cap (e.g. Ultra):** when Claude Code sends only
   `rate_limits.seven_day`, the statusline falls back to the weekly window
@@ -144,7 +146,8 @@ here.
   merge with a backup, SHA-256 verified downloads, and migration of the legacy
   Node hook entries.
 
-[Unreleased]: https://github.com/SrDarf/XClaudeUsage/compare/v0.1.6...HighPerformanceXClaudeUsage
+[Unreleased]: https://github.com/SrDarf/XClaudeUsage/compare/v0.1.7...HighPerformanceXClaudeUsage
+[0.1.7]: https://github.com/SrDarf/XClaudeUsage/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/SrDarf/XClaudeUsage/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/SrDarf/XClaudeUsage/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/SrDarf/XClaudeUsage/compare/v0.1.3...v0.1.4
