@@ -68,15 +68,15 @@ function writeRateLimitWindows(rateLimits) {
   }
 }
 
-function readWindowTokensFromDB(fiveHour) {
-  if (!fiveHour?.resets_at) return null;
+function readWindowTokensFromDB(window, seconds = FIVE_HOUR_SECONDS) {
+  if (!window?.resets_at) return null;
   if (!fs.existsSync(DB_PATH)) return null;
 
   const DatabaseSync = getDatabaseSync();
   if (!DatabaseSync) return null;
 
-  const end = fiveHour.resets_at;
-  const start = end - FIVE_HOUR_SECONDS;
+  const end = window.resets_at;
+  const start = end - seconds;
 
   let db;
   try {
@@ -220,6 +220,7 @@ function fmtCountdown(resetsAt) {
   const h = Math.floor(secsLeft / 3600);
   const m = Math.floor((secsLeft % 3600) / 60);
   const s = secsLeft % 60;
+  if (h >= 24) return `${Math.floor(h / 24)}d${String(h % 24).padStart(2, '0')}h`;
   if (h > 0) return `${h}h${String(m).padStart(2, '0')}m`;
   if (m > 0) return `${m}m${String(s).padStart(2, '0')}s`;
   return `${s}s`;
@@ -230,6 +231,36 @@ function fmtTokens(n) {
   if (n < 1000) return String(n);
   if (n < 1_000_000) return (n / 1000).toFixed(1) + 'k';
   return (n / 1_000_000).toFixed(2) + 'M';
+}
+
+function barColor(pct, weekly) {
+  if (pct < 50) return weekly ? '36' : '32';
+  if (pct < 65) return '33';
+  if (pct < 80) return '38;5;208';
+  return '31';
+}
+
+// 5-hour window: solid block bar.  ██████░░░░ out:427.0k/700.0k · 61% · resets:1h23m
+// 7-day window (plans without a 5h cap): "7d" tag + thin line bar, cyan when low.
+//                                        7d ━━━━────── out:1.20M/3.08M · 39% · resets:5d10h
+function renderWindow(win, tokens, weekly) {
+  const pct = Math.min(100, Math.max(0, Math.round(win.used_percentage)));
+  const filled = Math.floor(pct / 10);
+  const color = barColor(pct, weekly);
+
+  const bar = weekly
+    ? `\x1b[2m7d\x1b[0m \x1b[${color}m${'━'.repeat(filled)}\x1b[0m\x1b[2m${'─'.repeat(10 - filled)}\x1b[0m`
+    : `\x1b[${color}m${'█'.repeat(filled)}${'░'.repeat(10 - filled)}\x1b[0m`;
+
+  let outLabel = '';
+  if (tokens && tokens.output > 0) {
+    outLabel = win.used_percentage > 0
+      ? `out:${fmtTokens(tokens.output)}/${fmtTokens(Math.round(tokens.output / (win.used_percentage / 100)))} · `
+      : `out:${fmtTokens(tokens.output)} · `;
+  }
+
+  const countdownLabel = win.resets_at ? ` · resets:${fmtCountdown(win.resets_at)}` : '';
+  return `${bar} \x1b[2m${outLabel}${pct}%${countdownLabel}\x1b[0m`;
 }
 
 function runStatusline() {
@@ -248,39 +279,24 @@ function runStatusline() {
       const dir = data.workspace?.current_dir || process.cwd();
       const session = data.session_id || '';
 
-      let tokenStr = '';
-      const fiveHour = data.rate_limits?.five_hour;
+      // Plans without a 5-hour cap (e.g. Ultra) only send rate_limits.seven_day:
+      // fall back to the weekly window, drawn with its own bar style.
       writeRateLimitWindows(data.rate_limits);
-      const tokens = readWindowTokensFromDB(fiveHour) || readSessionTokens(data.transcript_path, session);
+      const fiveHour = data.rate_limits?.five_hour;
+      const sevenDay = data.rate_limits?.seven_day;
+      const hasPct = w => w != null && typeof w.used_percentage === 'number';
+      const active =
+        hasPct(fiveHour) ? { win: fiveHour, seconds: FIVE_HOUR_SECONDS, weekly: false } :
+        hasPct(sevenDay) ? { win: sevenDay, seconds: SEVEN_DAY_SECONDS, weekly: true } :
+        null;
 
-      if (fiveHour != null && fiveHour.used_percentage != null) {
-        const tokenPct = Math.min(100, Math.round(fiveHour.used_percentage));
-        const filled = Math.floor(tokenPct / 10);
-        const bar = '█'.repeat(filled) + '░'.repeat(10 - filled);
+      const tokens =
+        (active && readWindowTokensFromDB(active.win, active.seconds)) ||
+        readSessionTokens(data.transcript_path, session);
 
-        const barColor =
-          tokenPct < 50 ? '32' :
-          tokenPct < 65 ? '33' :
-          tokenPct < 80 ? '38;5;208' : '31';
-
-        let outLabel = '';
-        if (tokens && tokens.output > 0) {
-          const pct = fiveHour.used_percentage;
-          if (pct > 0) {
-            const realLimit = tokens.output / (pct / 100);
-            outLabel = `out:${fmtTokens(tokens.output)}/${fmtTokens(Math.round(realLimit))} · `;
-          } else {
-            outLabel = `out:${fmtTokens(tokens.output)} · `;
-          }
-        }
-
-        const countdownLabel = fiveHour.resets_at
-          ? ` · resets:${fmtCountdown(fiveHour.resets_at)}`
-          : '';
-
-        tokenStr =
-          ` │ \x1b[${barColor}m${bar}\x1b[0m ` +
-          `\x1b[2m${outLabel}${tokenPct}%${countdownLabel}\x1b[0m`;
+      let tokenStr = '';
+      if (active) {
+        tokenStr = ' │ ' + renderWindow(active.win, tokens, active.weekly);
       } else if (tokens && tokens.output > 0) {
         tokenStr = ` │ \x1b[2mout:${fmtTokens(tokens.output)}\x1b[0m`;
       }
