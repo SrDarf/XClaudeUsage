@@ -9,6 +9,20 @@ branch. The original Node.js implementation lives on `main`.
 
 ## [Unreleased]
 
+### Added
+- **Plans without a 5-hour cap (e.g. Ultra):** when Claude Code sends only
+  `rate_limits.seven_day`, the statusline falls back to the weekly window
+  instead of dropping the bar. Same block bar, lilac low band (under 50%),
+  `out:X/Y` summed over the last 7 days, and the countdown in days (`5d10h`).
+  Ported from the Node.js version on `main`.
+
+### Security
+- Bumped `rusqlite` 0.32 → 0.41, bundling a SQLite that fixes
+  RUSTSEC-2026-0459 (CVE-2026-119375).
+- Bumped `rustls` to 0.23.46, `rustls-webpki` to 0.103.16 and `webpki-roots`
+  to 1.0.11 (RUSTSEC-2026-0285, -0346, -0348, -0349, -0381, -0382), and
+  `anyhow` to 1.0.104 (RUSTSEC-2026-0190).
+
 ## [0.1.6] - 2026-06-11
 
 Hardening release: a full-branch code review surfaced 18 issues; all are fixed

@@ -18,6 +18,12 @@ use crate::transcript;
 /// harness-side timeout, so a pipe that never closes must not hang us.
 const STDIN_TIMEOUT: Duration = Duration::from_secs(3);
 
+const FIVE_HOUR_SECONDS: i64 = 5 * 3600;
+const SEVEN_DAY_SECONDS: i64 = 7 * 24 * 3600;
+
+/// 256-color lilac for the low band of the 7-day bar (same code as the JS).
+const WEEKLY_LOW_COLOR: &str = "38;5;183";
+
 #[derive(Deserialize, Default)]
 struct Payload {
     #[serde(default)]
@@ -101,22 +107,32 @@ pub fn run() -> Result<()> {
         _ => None,
     };
     if let Some(conn) = conn.as_ref() {
-        let _ = write_window(conn, five_hour, "five_hour_window", "start_at", 5 * 3600);
+        let _ = write_window(
+            conn,
+            five_hour,
+            "five_hour_window",
+            "start_at",
+            FIVE_HOUR_SECONDS,
+        );
         let _ = write_window(
             conn,
             seven_day,
             "seven_day_window",
             "starts_at",
-            7 * 24 * 3600,
+            SEVEN_DAY_SECONDS,
         );
     }
 
-    let tokens = conn
-        .as_ref()
-        .and_then(|conn| read_window_tokens(conn, five_hour).ok().flatten())
+    // Plans without a 5-hour cap (e.g. Ultra) only send rate_limits.seven_day:
+    // fall back to the weekly window, drawn in its own color.
+    let active = active_window(five_hour, seven_day);
+
+    let tokens = active
+        .zip(conn.as_ref())
+        .and_then(|(a, conn)| read_window_tokens(conn, a.window, a.seconds).ok().flatten())
         .or_else(|| read_session_tokens(payload.transcript_path.as_deref(), &session));
 
-    let token_str = render_token_segment(five_hour, tokens.as_ref());
+    let token_str = render_token_segment(active, tokens.as_ref());
 
     let dirname = Path::new(&dir)
         .file_name()
@@ -130,40 +146,50 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-fn render_token_segment(five_hour: Option<Window>, tokens: Option<&Totals>) -> String {
-    if let Some(fh) = five_hour {
-        if let Some(pct_raw) = fh.used_percentage {
-            let pct = pct_raw.min(100.0).round() as i64;
-            let filled = (pct / 10).clamp(0, 10) as usize;
-            let bar: String = "█".repeat(filled) + &"░".repeat(10 - filled);
-            let color = match pct {
-                p if p < 50 => "32",
-                p if p < 65 => "33",
-                p if p < 80 => "38;5;208",
-                _ => "31",
-            };
-            let mut out_label = String::new();
-            if let Some(t) = tokens {
-                if t.output > 0 {
-                    if pct_raw > 0.0 {
-                        let real_limit = (t.output as f64) / (pct_raw / 100.0);
-                        out_label = format!(
-                            "out:{}/{} · ",
-                            fmt_tokens(t.output),
-                            fmt_tokens(real_limit.round() as i64),
-                        );
-                    } else {
-                        out_label = format!("out:{} · ", fmt_tokens(t.output));
-                    }
-                }
+/// The rate-limit window the bar is drawn from.
+#[derive(Clone, Copy)]
+struct ActiveWindow {
+    window: Window,
+    seconds: i64,
+    weekly: bool,
+}
+
+/// The 5-hour window when it carries a percentage, else the 7-day one.
+fn active_window(five_hour: Option<Window>, seven_day: Option<Window>) -> Option<ActiveWindow> {
+    let has_pct = |w: &Window| w.used_percentage.is_some();
+    if let Some(window) = five_hour.filter(has_pct) {
+        return Some(ActiveWindow {
+            window,
+            seconds: FIVE_HOUR_SECONDS,
+            weekly: false,
+        });
+    }
+    seven_day.filter(has_pct).map(|window| ActiveWindow {
+        window,
+        seconds: SEVEN_DAY_SECONDS,
+        weekly: true,
+    })
+}
+
+fn bar_color(pct: i64, weekly: bool) -> &'static str {
+    match pct {
+        p if p < 50 => {
+            if weekly {
+                WEEKLY_LOW_COLOR
+            } else {
+                "32"
             }
-            let countdown = match fh.resets_at {
-                Some(r) => format!(" · resets:{}", fmt_countdown(r)),
-                None => String::new(),
-            };
-            return format!(
-                " │ \x1b[{color}m{bar}\x1b[0m \x1b[2m{out_label}{pct}%{countdown}\x1b[0m"
-            );
+        }
+        p if p < 65 => "33",
+        p if p < 80 => "38;5;208",
+        _ => "31",
+    }
+}
+
+fn render_token_segment(active: Option<ActiveWindow>, tokens: Option<&Totals>) -> String {
+    if let Some(a) = active {
+        if let Some(pct_raw) = a.window.used_percentage {
+            return format!(" │ {}", render_window(a.window, pct_raw, tokens, a.weekly));
         }
     }
     if let Some(t) = tokens {
@@ -172,6 +198,35 @@ fn render_token_segment(five_hour: Option<Window>, tokens: Option<&Totals>) -> S
         }
     }
     String::new()
+}
+
+/// Same block bar for both windows; the 7-day one (plans without a 5h cap)
+/// differs only in color: lilac instead of green in the low band.
+fn render_window(win: Window, pct_raw: f64, tokens: Option<&Totals>, weekly: bool) -> String {
+    let pct = pct_raw.clamp(0.0, 100.0).round() as i64;
+    let filled = (pct / 10) as usize;
+    let bar: String = "█".repeat(filled) + &"░".repeat(10 - filled);
+    let color = bar_color(pct, weekly);
+    let mut out_label = String::new();
+    if let Some(t) = tokens {
+        if t.output > 0 {
+            if pct_raw > 0.0 {
+                let real_limit = (t.output as f64) / (pct_raw / 100.0);
+                out_label = format!(
+                    "out:{}/{} · ",
+                    fmt_tokens(t.output),
+                    fmt_tokens(real_limit.round() as i64),
+                );
+            } else {
+                out_label = format!("out:{} · ", fmt_tokens(t.output));
+            }
+        }
+    }
+    let countdown = match win.resets_at {
+        Some(r) => format!(" · resets:{}", fmt_countdown(r)),
+        None => String::new(),
+    };
+    format!("\x1b[{color}m{bar}\x1b[0m \x1b[2m{out_label}{pct}%{countdown}\x1b[0m")
 }
 
 /// Upsert the singleton rate-limit window row for `table`. `start_col` is the
@@ -204,14 +259,11 @@ fn write_window(
     Ok(())
 }
 
-fn read_window_tokens(conn: &Connection, fh: Option<Window>) -> Result<Option<Totals>> {
-    let Some(fh) = fh else { return Ok(None) };
-    let Some(resets_at) = fh.resets_at else {
+fn read_window_tokens(conn: &Connection, window: Window, seconds: i64) -> Result<Option<Totals>> {
+    let Some(end) = window.resets_at else {
         return Ok(None);
     };
-    let end = resets_at;
-    let start = end - 5 * 3600;
-    query_window_tokens(conn, start, end)
+    query_window_tokens(conn, end - seconds, end)
 }
 
 /// Sum `token_usage` + `cloud_cache` rows whose `executed_at` falls in the
@@ -378,7 +430,9 @@ fn fmt_countdown_secs(secs_left: i64) -> String {
     let h = secs_left / 3600;
     let m = (secs_left % 3600) / 60;
     let s = secs_left % 60;
-    if h > 0 {
+    if h >= 24 {
+        format!("{}d{:02}h", h / 24, h % 24)
+    } else if h > 0 {
         format!("{h}h{m:02}m")
     } else if m > 0 {
         format!("{m}m{s:02}s")
@@ -411,6 +465,10 @@ mod tests {
         }
     }
 
+    fn five(w: Window) -> Option<ActiveWindow> {
+        active_window(Some(w), None)
+    }
+
     fn out_totals(output: i64) -> Totals {
         Totals {
             input: 0,
@@ -439,12 +497,44 @@ mod tests {
         assert_eq!(fmt_countdown_secs(3600), "1h00m");
         assert_eq!(fmt_countdown_secs(3661), "1h01m");
         assert_eq!(fmt_countdown_secs(7322), "2h02m");
+        assert_eq!(fmt_countdown_secs(86_399), "23h59m");
+        assert_eq!(fmt_countdown_secs(86_400), "1d00h");
+        assert_eq!(fmt_countdown_secs(5 * 86_400 + 10 * 3600 + 59), "5d10h");
+    }
+
+    #[test]
+    fn active_window_prefers_five_hour_and_falls_back_to_seven_day() {
+        let a = active_window(Some(win(None, Some(10.0))), Some(win(None, Some(40.0)))).unwrap();
+        assert!(!a.weekly);
+        assert_eq!(a.seconds, FIVE_HOUR_SECONDS);
+
+        // Ultra: only seven_day is sent.
+        let a = active_window(None, Some(win(None, Some(39.0)))).unwrap();
+        assert!(a.weekly);
+        assert_eq!(a.seconds, SEVEN_DAY_SECONDS);
+
+        // A five_hour object without a percentage does not win.
+        let a = active_window(Some(win(Some(1), None)), Some(win(None, Some(39.0)))).unwrap();
+        assert!(a.weekly);
+
+        assert!(active_window(None, Some(win(Some(1), None))).is_none());
+        assert!(active_window(None, None).is_none());
+    }
+
+    #[test]
+    fn render_weekly_low_band_is_lilac_other_bands_unchanged() {
+        let weekly = |pct| active_window(None, Some(win(None, Some(pct))));
+        let seg = render_token_segment(weekly(39.0), Some(&out_totals(3_280_000)));
+        assert!(seg.contains("\x1b[38;5;183m███░░░░░░░"), "got: {seg}");
+        assert!(seg.contains("out:3.28M/8.41M"), "got: {seg}");
+        assert!(render_token_segment(weekly(55.0), None).contains("\x1b[33m"));
+        assert!(render_token_segment(weekly(90.0), None).contains("\x1b[31m"));
     }
 
     #[test]
     fn render_extrapolates_real_limit_from_percentage() {
         // 300k output reported at 50% -> implied 5h limit of 600k.
-        let seg = render_token_segment(Some(win(None, Some(50.0))), Some(&out_totals(300_000)));
+        let seg = render_token_segment(five(win(None, Some(50.0))), Some(&out_totals(300_000)));
         assert!(seg.contains("out:300.0k/600.0k"), "got: {seg}");
         assert!(seg.contains("50%"), "got: {seg}");
         // 50 lands in the 50..65 band -> yellow "33".
@@ -455,15 +545,15 @@ mod tests {
 
     #[test]
     fn render_color_bands_track_percentage() {
-        assert!(render_token_segment(Some(win(None, Some(30.0))), None).contains("\x1b[32m"));
-        assert!(render_token_segment(Some(win(None, Some(70.0))), None).contains("\x1b[38;5;208m"));
-        assert!(render_token_segment(Some(win(None, Some(90.0))), None).contains("\x1b[31m"));
+        assert!(render_token_segment(five(win(None, Some(30.0))), None).contains("\x1b[32m"));
+        assert!(render_token_segment(five(win(None, Some(70.0))), None).contains("\x1b[38;5;208m"));
+        assert!(render_token_segment(five(win(None, Some(90.0))), None).contains("\x1b[31m"));
     }
 
     #[test]
     fn render_drops_limit_when_percentage_is_zero() {
         // pct_raw == 0 -> no divide, show the bare out:X label.
-        let seg = render_token_segment(Some(win(None, Some(0.0))), Some(&out_totals(427_000)));
+        let seg = render_token_segment(five(win(None, Some(0.0))), Some(&out_totals(427_000)));
         assert!(seg.contains("out:427.0k ·"), "got: {seg}");
         assert!(
             !seg.contains('/'),

@@ -56,6 +56,12 @@ When the payload reports `used_percentage`, the displayed limit is back-solved a
 `output / (used_percentage / 100)`, guarded against divide-by-zero. When the DB
 is unavailable, a legacy per-session transcript parser provides a fallback count.
 
+Plans without a 5-hour cap (Ultra) send only `rate_limits.seven_day`.
+`active_window` then picks the 7-day window instead: same bar and back-solve, the
+interval becomes `[resets_at - 7d, resets_at)`, and the low band is drawn in lilac
+(`38;5;183`) so it cannot be mistaken for the 5-hour bar. The 15-day retention
+keeps a full 7-day window queryable.
+
 ## Cloud sync and idempotency (`src/cloud/`)
 
 Multi-device sync is opt-in (Turso). Pushes go through an outbox:
