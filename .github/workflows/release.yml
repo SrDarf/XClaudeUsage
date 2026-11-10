@@ -34,7 +34,7 @@ jobs:
           # `cargo install --git ...` from the cargo install path documented
           # in README.md, or run the binary under Rosetta.
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
             archive: tar.gz
           - target: x86_64-pc-windows-msvc
             os: windows-latest
