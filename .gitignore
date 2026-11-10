@@ -1,5 +1,5 @@
 # Rust build artifacts
-/target/
+/target
 **/*.rs.bk
 
 # Cargo.lock is intentionally tracked: this is a binary crate, where committing
