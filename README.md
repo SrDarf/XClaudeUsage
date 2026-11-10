@@ -28,13 +28,13 @@ claude-sonnet-4-6 │ my-project │ ██████░░░░ out:427.0k/7
 - Orange — 65–79%
 - Red — 80%+
 
-**Plans without a 5-hour cap (e.g. Ultra).** When Claude Code sends only `rate_limits.seven_day`, the statusline falls back to the weekly window, drawn in its own style so the two are never confused:
+**Plans without a 5-hour cap (e.g. Ultra).** When Claude Code sends only `rate_limits.seven_day`, the statusline falls back to the weekly window. The bar is the same; only the color changes, so the two are not confused:
 
 ```
-claude-opus-5-5 │ my-project │ 7d ━━━━────── out:3.28M/8.42M · 39% · resets:5d10h
+claude-opus-5-5 │ my-project │ ███░░░░░░░ out:3.28M/8.42M · 39% · resets:5d10h
 ```
 
-The `7d` tag and the thin line bar (`━` filled, `─` empty) mark the weekly window; the low band is cyan instead of green, the other bands keep the colors above. `out:X/Y` sums the last 7 days and the countdown switches to days (`5d10h`). When both windows are present, the 5-hour bar is shown as before.
+In the weekly window the low band (under 50%) is cyan instead of green; the other bands keep the colors above. `out:X/Y` sums the last 7 days and the countdown switches to days (`5d10h`). When both windows are present, the 5-hour bar is shown as before.
 
 ---
 

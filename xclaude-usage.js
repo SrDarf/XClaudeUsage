@@ -240,17 +240,14 @@ function barColor(pct, weekly) {
   return '31';
 }
 
-// 5-hour window: solid block bar.  ██████░░░░ out:427.0k/700.0k · 61% · resets:1h23m
-// 7-day window (plans without a 5h cap): "7d" tag + thin line bar, cyan when low.
-//                                        7d ━━━━────── out:1.20M/3.08M · 39% · resets:5d10h
+// Same block bar for both windows; the 7-day one (plans without a 5h cap)
+// differs only in color: cyan instead of green in the low band.
 function renderWindow(win, tokens, weekly) {
   const pct = Math.min(100, Math.max(0, Math.round(win.used_percentage)));
   const filled = Math.floor(pct / 10);
   const color = barColor(pct, weekly);
 
-  const bar = weekly
-    ? `\x1b[2m7d\x1b[0m \x1b[${color}m${'━'.repeat(filled)}\x1b[0m\x1b[2m${'─'.repeat(10 - filled)}\x1b[0m`
-    : `\x1b[${color}m${'█'.repeat(filled)}${'░'.repeat(10 - filled)}\x1b[0m`;
+  const bar = `\x1b[${color}m${'█'.repeat(filled)}${'░'.repeat(10 - filled)}\x1b[0m`;
 
   let outLabel = '';
   if (tokens && tokens.output > 0) {
@@ -280,7 +277,7 @@ function runStatusline() {
       const session = data.session_id || '';
 
       // Plans without a 5-hour cap (e.g. Ultra) only send rate_limits.seven_day:
-      // fall back to the weekly window, drawn with its own bar style.
+      // fall back to the weekly window, drawn in its own color.
       writeRateLimitWindows(data.rate_limits);
       const fiveHour = data.rate_limits?.five_hour;
       const sevenDay = data.rate_limits?.seven_day;
