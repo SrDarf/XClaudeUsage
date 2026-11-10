@@ -34,7 +34,7 @@ claude-sonnet-4-6 │ my-project │ ██████░░░░ out:427.0k/7
 claude-opus-5-5 │ my-project │ ███░░░░░░░ out:3.28M/8.42M · 39% · resets:5d10h
 ```
 
-In the weekly window the low band (under 50%) is cyan instead of green; the other bands keep the colors above. `out:X/Y` sums the last 7 days and the countdown switches to days (`5d10h`). When both windows are present, the 5-hour bar is shown as before.
+In the weekly window the low band (under 50%) is lilac instead of green; the other bands keep the colors above. `out:X/Y` sums the last 7 days and the countdown switches to days (`5d10h`). When both windows are present, the 5-hour bar is shown as before.
 
 ---
 

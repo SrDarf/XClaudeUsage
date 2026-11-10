@@ -36,6 +36,6 @@ jobs:
           echo
           printf '%s' '{"model":{"display_name":"claude-sonnet-4-6"},"workspace":{"current_dir":"/tmp"},"session_id":"smoke","transcript_path":"/tmp/does-not-exist.jsonl"}' | node xclaude-usage.js
           echo
-          printf '%s' '{"model":{"display_name":"claude-opus-5-5"},"workspace":{"current_dir":"/tmp"},"rate_limits":{"seven_day":{"used_percentage":39,"resets_at":4102444800}}}' | node xclaude-usage.js | grep -q '36m'
+          printf '%s' '{"model":{"display_name":"claude-opus-5-5"},"workspace":{"current_dir":"/tmp"},"rate_limits":{"seven_day":{"used_percentage":39,"resets_at":4102444800}}}' | node xclaude-usage.js | grep -q '38;5;183m'
           echo
           echo "statusline smoke ok"

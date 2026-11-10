@@ -234,14 +234,14 @@ function fmtTokens(n) {
 }
 
 function barColor(pct, weekly) {
-  if (pct < 50) return weekly ? '36' : '32';
+  if (pct < 50) return weekly ? '38;5;183' : '32';
   if (pct < 65) return '33';
   if (pct < 80) return '38;5;208';
   return '31';
 }
 
 // Same block bar for both windows; the 7-day one (plans without a 5h cap)
-// differs only in color: cyan instead of green in the low band.
+// differs only in color: lilac instead of green in the low band.
 function renderWindow(win, tokens, weekly) {
   const pct = Math.min(100, Math.max(0, Math.round(win.used_percentage)));
   const filled = Math.floor(pct / 10);
