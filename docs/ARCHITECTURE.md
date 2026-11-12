@@ -62,6 +62,23 @@ interval becomes `[resets_at - 7d, resets_at)`, and the low band is drawn in lil
 (`38;5;183`) so it cannot be mistaken for the 5-hour bar. The 15-day retention
 keeps a full 7-day window queryable.
 
+### Early resets (`reset_at`)
+
+Anthropic can reset a quota before `resets_at` (a global reset, or one the user
+redeems). `used_percentage` then drops while `resets_at` stays the same. Only the
+hook sees the old and the new value at once, so `write_window` detects it inside
+its UPSERT: same `resets_at` and a drop of more than `RESET_DROP_POINTS` (1 point,
+to ignore rounding) stamps `reset_at` with the write time; a new `resets_at`
+clears it. Both `five_hour_window` and `seven_day_window` carry the column
+(nullable, added by `migrate` with `ALTER TABLE` on older databases).
+
+The current budget starts at `max(start, reset_at)`, and the statusline sums
+tokens from there. Readers such as XClaudeDashboard should do the same, and
+trust `reset_at` only when `starts_at <= reset_at < resets_at`: the Node.js writer
+on `main` does not know the column and leaves it untouched. `reset_at` is when
+the hook noticed the drop, so it can lag the real reset by as long as no Claude
+Code session was refreshing the statusline.
+
 ## Cloud sync and idempotency (`src/cloud/`)
 
 Multi-device sync is opt-in (Turso). Pushes go through an outbox:

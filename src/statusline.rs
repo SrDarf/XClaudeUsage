@@ -18,8 +18,29 @@ use crate::transcript;
 /// harness-side timeout, so a pipe that never closes must not hang us.
 const STDIN_TIMEOUT: Duration = Duration::from_secs(3);
 
-const FIVE_HOUR_SECONDS: i64 = 5 * 3600;
-const SEVEN_DAY_SECONDS: i64 = 7 * 24 * 3600;
+/// One rate-limit window and the singleton table that stores it. The names are
+/// fixed constants, never user input (no injection risk in the `format!`ed SQL).
+struct WindowTable {
+    table: &'static str,
+    /// The window-start column: `start_at` / `starts_at` (historical naming).
+    start_col: &'static str,
+    seconds: i64,
+}
+
+const FIVE_HOUR: WindowTable = WindowTable {
+    table: "five_hour_window",
+    start_col: "start_at",
+    seconds: 5 * 3600,
+};
+const SEVEN_DAY: WindowTable = WindowTable {
+    table: "seven_day_window",
+    start_col: "starts_at",
+    seconds: 7 * 24 * 3600,
+};
+
+/// A drop in `used_percentage` within the same `resets_at` larger than this is
+/// an early reset (a global reset or a redeemed one), not rounding noise.
+const RESET_DROP_POINTS: f64 = 1.0;
 
 /// 256-color lilac for the low band of the 7-day bar (same code as the JS).
 const WEEKLY_LOW_COLOR: &str = "38;5;183";
@@ -107,20 +128,9 @@ pub fn run() -> Result<()> {
         _ => None,
     };
     if let Some(conn) = conn.as_ref() {
-        let _ = write_window(
-            conn,
-            five_hour,
-            "five_hour_window",
-            "start_at",
-            FIVE_HOUR_SECONDS,
-        );
-        let _ = write_window(
-            conn,
-            seven_day,
-            "seven_day_window",
-            "starts_at",
-            SEVEN_DAY_SECONDS,
-        );
+        let now = unix_now();
+        let _ = write_window(conn, five_hour, &FIVE_HOUR, now);
+        let _ = write_window(conn, seven_day, &SEVEN_DAY, now);
     }
 
     // Plans without a 5-hour cap (e.g. Ultra) only send rate_limits.seven_day:
@@ -129,7 +139,7 @@ pub fn run() -> Result<()> {
 
     let tokens = active
         .zip(conn.as_ref())
-        .and_then(|(a, conn)| read_window_tokens(conn, a.window, a.seconds).ok().flatten())
+        .and_then(|(a, conn)| read_window_tokens(conn, a.window, a.table).ok().flatten())
         .or_else(|| read_session_tokens(payload.transcript_path.as_deref(), &session));
 
     let token_str = render_token_segment(active, tokens.as_ref());
@@ -150,7 +160,7 @@ pub fn run() -> Result<()> {
 #[derive(Clone, Copy)]
 struct ActiveWindow {
     window: Window,
-    seconds: i64,
+    table: &'static WindowTable,
     weekly: bool,
 }
 
@@ -160,13 +170,13 @@ fn active_window(five_hour: Option<Window>, seven_day: Option<Window>) -> Option
     if let Some(window) = five_hour.filter(has_pct) {
         return Some(ActiveWindow {
             window,
-            seconds: FIVE_HOUR_SECONDS,
+            table: &FIVE_HOUR,
             weekly: false,
         });
     }
     seven_day.filter(has_pct).map(|window| ActiveWindow {
         window,
-        seconds: SEVEN_DAY_SECONDS,
+        table: &SEVEN_DAY,
         weekly: true,
     })
 }
@@ -229,41 +239,73 @@ fn render_window(win: Window, pct_raw: f64, tokens: Option<&Totals>, weekly: boo
     format!("\x1b[{color}m{bar}\x1b[0m \x1b[2m{out_label}{pct}%{countdown}\x1b[0m")
 }
 
-/// Upsert the singleton rate-limit window row for `table`. `start_col` is the
-/// table's window-start column (`start_at` / `starts_at`) and `window_secs` the
-/// window length — both fixed constants, never user input (no injection risk in
-/// the `format!`ed SQL).
+/// Upsert the singleton rate-limit window row. The hook is the only place that
+/// sees both the stored and the new value, so it also detects an early reset:
+/// same `resets_at` but `used_percentage` clearly lower stamps `reset_at = now`.
+/// A new `resets_at` is a new window and clears it. SQLite evaluates every SET
+/// expression against the old row, so the detection is part of the same atomic
+/// statement and two concurrent hooks cannot interleave a read and a write.
 fn write_window(
     conn: &Connection,
     window: Option<Window>,
-    table: &str,
-    start_col: &str,
-    window_secs: i64,
+    wt: &WindowTable,
+    now: i64,
 ) -> Result<()> {
     let Some(window) = window else { return Ok(()) };
     let (Some(resets_at), Some(used)) = (window.resets_at, window.used_percentage) else {
         return Ok(());
     };
-    let start = resets_at - window_secs;
-    let now = unix_now();
+    let start = resets_at - wt.seconds;
+    let WindowTable {
+        table, start_col, ..
+    } = wt;
     let sql = format!(
-        "INSERT INTO {table} (id, resets_at, {start_col}, used_percentage, updated_at) \
-         VALUES (1, ?1, ?2, ?3, ?4) \
+        "INSERT INTO {table} (id, resets_at, {start_col}, used_percentage, updated_at, reset_at) \
+         VALUES (1, ?1, ?2, ?3, ?4, NULL) \
          ON CONFLICT(id) DO UPDATE SET \
+           reset_at = CASE \
+             WHEN excluded.resets_at <> {table}.resets_at THEN NULL \
+             WHEN excluded.used_percentage < {table}.used_percentage - ?5 THEN excluded.updated_at \
+             ELSE {table}.reset_at END, \
            resets_at = excluded.resets_at, \
            {start_col} = excluded.{start_col}, \
            used_percentage = excluded.used_percentage, \
            updated_at = excluded.updated_at"
     );
-    conn.execute(&sql, params![resets_at, start, used, now])?;
+    conn.execute(
+        &sql,
+        params![resets_at, start, used, now, RESET_DROP_POINTS],
+    )?;
     Ok(())
 }
 
-fn read_window_tokens(conn: &Connection, window: Window, seconds: i64) -> Result<Option<Totals>> {
+/// Tokens spent in the current budget: from the window start, or from the
+/// early reset when one was recorded for this same window.
+fn read_window_tokens(
+    conn: &Connection,
+    window: Window,
+    wt: &WindowTable,
+) -> Result<Option<Totals>> {
     let Some(end) = window.resets_at else {
         return Ok(None);
     };
-    query_window_tokens(conn, end - seconds, end)
+    let reset_at: Option<i64> = conn
+        .query_row(
+            &format!(
+                "SELECT reset_at FROM {} WHERE id = 1 AND resets_at = ?1",
+                wt.table
+            ),
+            params![end],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let start = (end - wt.seconds).max(reset_at.unwrap_or(i64::MIN));
+    let totals = query_window_tokens(conn, start, end)?;
+    // Right after a reset the budget is genuinely empty: report zero instead of
+    // None, or the caller falls back to the session transcript and shows tokens
+    // spent before the reset.
+    Ok(totals.or(reset_at.map(|_| Totals::default())))
 }
 
 /// Sum `token_usage` + `cloud_cache` rows whose `executed_at` falls in the
@@ -506,12 +548,12 @@ mod tests {
     fn active_window_prefers_five_hour_and_falls_back_to_seven_day() {
         let a = active_window(Some(win(None, Some(10.0))), Some(win(None, Some(40.0)))).unwrap();
         assert!(!a.weekly);
-        assert_eq!(a.seconds, FIVE_HOUR_SECONDS);
+        assert_eq!(a.table.table, FIVE_HOUR.table);
 
         // Ultra: only seven_day is sent.
         let a = active_window(None, Some(win(None, Some(39.0)))).unwrap();
         assert!(a.weekly);
-        assert_eq!(a.seconds, SEVEN_DAY_SECONDS);
+        assert_eq!(a.table.table, SEVEN_DAY.table);
 
         // A five_hour object without a percentage does not win.
         let a = active_window(Some(win(Some(1), None)), Some(win(None, Some(39.0)))).unwrap();
@@ -627,5 +669,103 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         crate::db::schema::migrate(&conn).unwrap();
         assert!(query_window_tokens(&conn, 0, 100).unwrap().is_none());
+    }
+
+    fn mem_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::migrate(&conn).unwrap();
+        conn
+    }
+
+    fn stored_reset_at(conn: &Connection) -> Option<i64> {
+        conn.query_row("SELECT reset_at FROM seven_day_window", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn write_window_records_early_reset_and_clears_it_on_new_window() {
+        let conn = mem_db();
+        let resets = 10_000_000;
+        let w = |pct| Some(win(Some(resets), Some(pct)));
+
+        write_window(&conn, w(97.0), &SEVEN_DAY, 100).unwrap();
+        assert_eq!(stored_reset_at(&conn), None, "first write is not a reset");
+        write_window(&conn, w(98.0), &SEVEN_DAY, 200).unwrap();
+        assert_eq!(stored_reset_at(&conn), None, "rising usage is not a reset");
+        write_window(&conn, w(97.5), &SEVEN_DAY, 250).unwrap();
+        assert_eq!(
+            stored_reset_at(&conn),
+            None,
+            "a drop within 1 point is noise"
+        );
+
+        // The real case from issue #8: 98 -> 2 with the same resets_at.
+        write_window(&conn, w(2.0), &SEVEN_DAY, 300).unwrap();
+        assert_eq!(stored_reset_at(&conn), Some(300));
+        write_window(&conn, w(5.0), &SEVEN_DAY, 400).unwrap();
+        assert_eq!(
+            stored_reset_at(&conn),
+            Some(300),
+            "kept while usage grows again"
+        );
+
+        write_window(
+            &conn,
+            Some(win(Some(resets + 7 * 86_400), Some(1.0))),
+            &SEVEN_DAY,
+            500,
+        )
+        .unwrap();
+        assert_eq!(stored_reset_at(&conn), None, "a new window clears it");
+    }
+
+    #[test]
+    fn read_window_tokens_starts_at_the_early_reset() {
+        let conn = mem_db();
+        let end = 10_000_000i64;
+        let start = end - SEVEN_DAY.seconds;
+        for (at, qty) in [(start + 10, 1_000), (start + 500, 20)] {
+            conn.execute(
+                "INSERT INTO token_usage (session_id, model, token_type, quantity, executed_at) \
+                 VALUES ('s','m','output',?1,?2)",
+                params![qty, at],
+            )
+            .unwrap();
+        }
+        let w = |pct| Some(win(Some(end), Some(pct)));
+        write_window(&conn, w(98.0), &SEVEN_DAY, start + 100).unwrap();
+        let before = read_window_tokens(&conn, w(98.0).unwrap(), &SEVEN_DAY).unwrap();
+        assert_eq!(before.unwrap().output, 1_020);
+
+        write_window(&conn, w(2.0), &SEVEN_DAY, start + 200).unwrap();
+        let after = read_window_tokens(&conn, w(2.0).unwrap(), &SEVEN_DAY).unwrap();
+        assert_eq!(
+            after.unwrap().output,
+            20,
+            "tokens before the reset no longer count"
+        );
+
+        // A reset with nothing spent since is zero, not None (which would fall
+        // back to the session transcript).
+        write_window(&conn, w(0.0), &SEVEN_DAY, start + 600).unwrap();
+        let empty = read_window_tokens(&conn, w(0.0).unwrap(), &SEVEN_DAY).unwrap();
+        assert_eq!(empty.unwrap().output, 0);
+    }
+
+    #[test]
+    fn migrate_adds_reset_at_to_an_existing_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE seven_day_window (id INTEGER PRIMARY KEY CHECK (id = 1), \
+               resets_at INTEGER NOT NULL, starts_at INTEGER NOT NULL, \
+               used_percentage REAL NOT NULL, updated_at INTEGER NOT NULL); \
+             INSERT INTO seven_day_window VALUES (1, 10, 0, 50.0, 5);",
+        )
+        .unwrap();
+        crate::db::schema::migrate(&conn).unwrap();
+        crate::db::schema::migrate(&conn).unwrap(); // idempotent
+        assert_eq!(stored_reset_at(&conn), None, "existing row keeps working");
+        write_window(&conn, Some(win(Some(10), Some(3.0))), &SEVEN_DAY, 9).unwrap();
+        assert_eq!(stored_reset_at(&conn), Some(9));
     }
 }

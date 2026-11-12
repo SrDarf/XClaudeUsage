@@ -9,6 +9,15 @@ branch. The original Node.js implementation lives on `main`.
 
 ## [Unreleased]
 
+### Fixed
+- **Early quota resets** ([#8](https://github.com/SrDarf/XClaudeUsage/issues/8)):
+  when Anthropic resets the 5-hour or weekly quota before `resets_at` (a global
+  reset or a redeemed one), the statusline kept summing the tokens spent before
+  it, so `out:X/Y` showed a limit many times too large (`26.60M/332.52M` at 8%
+  in the reported case). The hook now detects the drop and records it in a new
+  nullable `reset_at` column on `five_hour_window` and `seven_day_window`, and
+  the token sum starts there. Existing databases get the column on the next run.
+
 ## [0.1.7] - 2026-11-10
 
 ### Added

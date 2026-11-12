@@ -53,7 +53,8 @@ CREATE TABLE IF NOT EXISTS five_hour_window (
   resets_at       INTEGER NOT NULL,
   start_at        INTEGER NOT NULL,
   used_percentage REAL    NOT NULL,
-  updated_at      INTEGER NOT NULL
+  updated_at      INTEGER NOT NULL,
+  reset_at        INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS seven_day_window (
@@ -61,11 +62,31 @@ CREATE TABLE IF NOT EXISTS seven_day_window (
   resets_at       INTEGER NOT NULL,
   starts_at       INTEGER NOT NULL,
   used_percentage REAL    NOT NULL,
-  updated_at      INTEGER NOT NULL
+  updated_at      INTEGER NOT NULL,
+  reset_at        INTEGER
 );
 "#;
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(DDL)?;
+    // `CREATE TABLE IF NOT EXISTS` never alters an existing table, so databases
+    // created before `reset_at` existed get the column here. It is nullable, so
+    // older readers and the Node.js writer keep working unchanged.
+    for table in ["five_hour_window", "seven_day_window"] {
+        if !has_column(conn, table, "reset_at")? {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN reset_at INTEGER"))?;
+        }
+    }
     Ok(())
+}
+
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for name in names {
+        if name? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
