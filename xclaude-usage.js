@@ -13,6 +13,11 @@ const RATE_LIMIT_WINDOWS = [
   { key: 'five_hour', table: 'five_hour_window', startCol: 'start_at', seconds: FIVE_HOUR_SECONDS },
   { key: 'seven_day', table: 'seven_day_window', startCol: 'starts_at', seconds: SEVEN_DAY_SECONDS },
 ];
+const [FIVE_HOUR_WINDOW, SEVEN_DAY_WINDOW] = RATE_LIMIT_WINDOWS;
+
+// A drop in used_percentage within the same resets_at larger than this is an
+// early reset (a global reset or a redeemed one), not rounding noise.
+const RESET_DROP_POINTS = 1;
 
 function getDatabaseSync() {
   try { return require('node:sqlite').DatabaseSync; } catch { return null; }
@@ -49,18 +54,33 @@ function writeRateLimitWindows(rateLimits) {
           resets_at       INTEGER NOT NULL,
           ${startCol}     INTEGER NOT NULL,
           used_percentage REAL    NOT NULL,
-          updated_at      INTEGER NOT NULL
+          updated_at      INTEGER NOT NULL,
+          reset_at        INTEGER
         )
       `);
+      // CREATE TABLE IF NOT EXISTS never alters an existing table: databases
+      // created before reset_at existed get the (nullable) column here.
+      const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+      if (!cols.some(c => c.name === 'reset_at')) {
+        db.exec(`ALTER TABLE ${table} ADD COLUMN reset_at INTEGER`);
+      }
+      // Same resets_at but used_percentage clearly lower is an early reset:
+      // stamp reset_at. A new resets_at is a new window and clears it. SQLite
+      // evaluates every SET expression against the old row, so the detection is
+      // atomic with the write and concurrent hooks cannot interleave.
       db.prepare(`
-        INSERT INTO ${table} (id, resets_at, ${startCol}, used_percentage, updated_at)
-        VALUES (1, ?, ?, ?, ?)
+        INSERT INTO ${table} (id, resets_at, ${startCol}, used_percentage, updated_at, reset_at)
+        VALUES (1, ?, ?, ?, ?, NULL)
         ON CONFLICT(id) DO UPDATE SET
+          reset_at = CASE
+            WHEN excluded.resets_at <> ${table}.resets_at THEN NULL
+            WHEN excluded.used_percentage < ${table}.used_percentage - ? THEN excluded.updated_at
+            ELSE ${table}.reset_at END,
           resets_at       = excluded.resets_at,
           ${startCol}     = excluded.${startCol},
           used_percentage = excluded.used_percentage,
           updated_at      = excluded.updated_at
-      `).run(data.resets_at, data.resets_at - seconds, data.used_percentage, now);
+      `).run(data.resets_at, data.resets_at - seconds, data.used_percentage, now, RESET_DROP_POINTS);
     }
   } catch {
   } finally {
@@ -68,7 +88,9 @@ function writeRateLimitWindows(rateLimits) {
   }
 }
 
-function readWindowTokensFromDB(window, seconds = FIVE_HOUR_SECONDS) {
+// Tokens spent in the current budget: from the window start, or from the early
+// reset when one was recorded for this same window.
+function readWindowTokensFromDB(window, { table, seconds } = FIVE_HOUR_WINDOW) {
   if (!window?.resets_at) return null;
   if (!fs.existsSync(DB_PATH)) return null;
 
@@ -76,12 +98,18 @@ function readWindowTokensFromDB(window, seconds = FIVE_HOUR_SECONDS) {
   if (!DatabaseSync) return null;
 
   const end = window.resets_at;
-  const start = end - seconds;
 
   let db;
   try {
     db = new DatabaseSync(DB_PATH, { readOnly: true });
     db.exec('PRAGMA busy_timeout = 2000;');
+
+    let resetAt = null;
+    try {
+      const row = db.prepare(`SELECT reset_at FROM ${table} WHERE id = 1 AND resets_at = ?`).get(end);
+      if (row && row.reset_at != null) resetAt = Number(row.reset_at);
+    } catch {}
+    const start = resetAt != null ? Math.max(end - seconds, resetAt) : end - seconds;
 
     const totals = { input: 0, output: 0, cache_creation: 0, cache_read: 0 };
     let anyRows = false;
@@ -119,7 +147,10 @@ function readWindowTokensFromDB(window, seconds = FIVE_HOUR_SECONDS) {
       }
     } catch {}
 
-    return anyRows ? totals : null;
+    // Right after a reset the budget is genuinely empty: report zero instead of
+    // null, or the caller falls back to the session transcript and shows tokens
+    // spent before the reset.
+    return anyRows || resetAt != null ? totals : null;
   } catch {
     return null;
   } finally {
@@ -283,12 +314,12 @@ function runStatusline() {
       const sevenDay = data.rate_limits?.seven_day;
       const hasPct = w => w != null && typeof w.used_percentage === 'number';
       const active =
-        hasPct(fiveHour) ? { win: fiveHour, seconds: FIVE_HOUR_SECONDS, weekly: false } :
-        hasPct(sevenDay) ? { win: sevenDay, seconds: SEVEN_DAY_SECONDS, weekly: true } :
+        hasPct(fiveHour) ? { win: fiveHour, table: FIVE_HOUR_WINDOW, weekly: false } :
+        hasPct(sevenDay) ? { win: sevenDay, table: SEVEN_DAY_WINDOW, weekly: true } :
         null;
 
       const tokens =
-        (active && readWindowTokensFromDB(active.win, active.seconds)) ||
+        (active && readWindowTokensFromDB(active.win, active.table)) ||
         readSessionTokens(data.transcript_path, session);
 
       let tokenStr = '';
