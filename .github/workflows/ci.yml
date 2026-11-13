@@ -39,3 +39,22 @@ jobs:
           printf '%s' '{"model":{"display_name":"claude-opus-5-5"},"workspace":{"current_dir":"/tmp"},"rate_limits":{"seven_day":{"used_percentage":39,"resets_at":4102444800}}}' | node xclaude-usage.js | grep -q '38;5;183m'
           echo
           echo "statusline smoke ok"
+
+      - name: Early reset smoke (issue #8)
+        run: |
+          HOME="$(mktemp -d)"
+          export HOME
+          mkdir -p "$HOME/.claude/data"
+          now=$(date +%s); resets=$((now + 86400))
+          node -e '
+            const db = new (require("node:sqlite").DatabaseSync)(process.env.HOME + "/.claude/data/xclaude-usage.db");
+            db.exec("CREATE TABLE token_usage (session_id TEXT, model TEXT, token_type TEXT, quantity INTEGER, executed_at INTEGER)");
+            db.prepare("INSERT INTO token_usage VALUES (\x27s\x27, \x27m\x27, \x27output\x27, 5000000, ?)").run(Number(process.argv[1]) - 3600);
+          ' "$now"
+          payload() { printf '{"rate_limits":{"seven_day":{"used_percentage":%s,"resets_at":%s}}}' "$1" "$resets"; }
+          payload 98 | node xclaude-usage.js | grep -q 'out:5.00M'
+          # Same resets_at, usage drops to 2%: tokens before the reset no longer count.
+          out=$(payload 2 | node xclaude-usage.js)
+          echo "$out"
+          if printf '%s' "$out" | grep -q 'out:'; then echo "reset not applied"; exit 1; fi
+          echo "early reset smoke ok"
