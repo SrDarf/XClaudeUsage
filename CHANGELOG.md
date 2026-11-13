@@ -9,6 +9,8 @@ branch. The original Node.js implementation lives on `main`.
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-11-13
+
 ### Fixed
 - **Early quota resets** ([#8](https://github.com/SrDarf/XClaudeUsage/issues/8)):
   when Anthropic resets the 5-hour or weekly quota before `resets_at` (a global
@@ -155,7 +157,8 @@ here.
   merge with a backup, SHA-256 verified downloads, and migration of the legacy
   Node hook entries.
 
-[Unreleased]: https://github.com/SrDarf/XClaudeUsage/compare/v0.1.7...HighPerformanceXClaudeUsage
+[Unreleased]: https://github.com/SrDarf/XClaudeUsage/compare/v0.1.8...HighPerformanceXClaudeUsage
+[0.1.8]: https://github.com/SrDarf/XClaudeUsage/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/SrDarf/XClaudeUsage/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/SrDarf/XClaudeUsage/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/SrDarf/XClaudeUsage/compare/v0.1.4...v0.1.5
